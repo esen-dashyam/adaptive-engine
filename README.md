@@ -1,63 +1,400 @@
 # Adaptive Learning Engine
 
-An adaptive K1–K8 assessment platform that combines a 144,000-node curriculum knowledge graph, item response theory, Bayesian knowledge tracing, and Google Gemini to deliver personalized assessments, identify learning gaps, and tutor students through a conversational AI interface.
+> An adaptive K1–K8 assessment platform combining a 144,733-node curriculum knowledge graph, Item Response Theory, Bayesian Knowledge Tracing, a Neuro-Symbolic Signal Bridge, and Google Gemini to deliver personalized assessments, detect learning gaps, and tutor students through a conversational AI interface.
 
 ---
 
-## What it does
+## Table of Contents
 
-1. **Adaptive Assessment (Phase A)** — Selects curriculum standards from Neo4j ranked by IRT Fisher Information at the student's current ability level (θ). Gemini generates fresh multiple-choice questions grounded in the graph's prerequisite chains and sibling standards (GraphRAG). No static question bank.
-
-2. **Deep Evaluation (Phase B)** — Scores answers with Rasch 1PL IRT to update θ, runs Bayesian Knowledge Tracing to update per-standard mastery probabilities, detects misconceptions, propagates mastery through the knowledge graph via KST, ranks learning gaps by downstream blocking impact, and generates targeted remediation exercises.
-
-3. **AI Tutor** — After results load, a Gemini-powered chat window opens automatically. The tutor is grounded in the full evaluation result: score, θ, every gap with its mastery probability, recommended learning path, and remediation exercises. Students can ask follow-up questions in natural language.
-
-4. **Recommendation Engine** — Identifies the Zone of Proximal Development frontier in the knowledge graph and returns the 3–5 next concepts optimally positioned between the student's current ability and the next challenge level.
+- [What It Does](#what-it-does)
+- [System Architecture](#system-architecture)
+- [Core Features](#core-features)
+- [Knowledge Graph](#knowledge-graph)
+- [Learning Science](#learning-science)
+- [API Reference](#api-reference)
+- [Tech Stack](#tech-stack)
+- [Quick Start](#quick-start)
+- [Environment Variables](#environment-variables)
+- [Project Structure](#project-structure)
 
 ---
 
-## How the knowledge graph drives everything
+## What It Does
 
-The Neo4j database holds **144,733 StandardsFrameworkItem** nodes spanning K–12 Mathematics and English Language Arts for all 50 US states plus Multi-State (CCSS) standards.
-
-Each node is connected by typed edges that encode curriculum dependencies:
-
-| Edge type | Meaning | Weight property |
-|-----------|---------|-----------------|
-| `PRECEDES` | This standard comes before the next | — |
-| `BUILDS_TOWARDS` | Conceptual prerequisite | `conceptual_weight` |
-| `DEFINES_UNDERSTANDING` | Understanding dependency | `understanding_strength` |
-| `HAS_CHILD` | Parent→child cluster | — |
-
-Student mastery is stored on `SKILL_STATE` edges between `Student` nodes and `StandardsFrameworkItem` nodes:
-
-```cypher
-(:Student)-[:SKILL_STATE {
-  p_mastery,    // Bayesian posterior P(student has mastered this)
-  p_transit,    // P(learning on next attempt)
-  p_slip,       // P(knows but answers wrong)
-  p_guess,      // P(doesn't know but guesses right)
-  attempts,
-  correct
-}]->(:StandardsFrameworkItem)
+```
+Student answers questions
+        │
+        ▼
+┌───────────────────┐     IRT Fisher Information ranking
+│   PHASE A         │──►  GraphRAG context from Neo4j
+│   Assessment      │     Gemini generates fresh questions
+│   Generation      │     No static question bank
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐     Rasch 1PL θ update + SE computation
+│   PHASE B         │──►  Elastic Stopping (SE < 0.30 or ≥ 25 Qs)
+│   Deep            │     φ-Modified BKT mastery update
+│   Evaluation      │     Misconception detection
+│   (20-node        │     Cognitive Load Pruning (TEMPORARY_BLOCK)
+│   LangGraph)      │     LCA Safety Net + Recursive Pivot
+└───────────────────┘     Gap ranking + Remediation + Recommendations
+        │
+        ▼
+┌───────────────────┐     Gemini-powered multi-turn tutor
+│   AI TUTOR        │──►  Grounded in full evaluation result
+│   Chat            │     Live exercise sessions with φ feedback
+└───────────────────┘     Back-and-Forth recursive adaptation
 ```
 
 ---
 
-## Tech stack
+## System Architecture
+
+### Phase A — Assessment Generation
+
+1. **IRT Standard Selection** — Queries Neo4j for curriculum standards ranked by Fisher Information `I(θ,β) = P(1−P)`, maximizing diagnostic signal at the student's current ability level θ. Excludes already-asked nodes and concepts currently TEMPORARY_BLOCKed for the student.
+2. **GraphRAG Context** — Fetches prerequisite chains, sibling standards, and mastery context from Neo4j to ground question generation.
+3. **Gemini Question Generation** — Generates fresh multiple-choice questions calibrated to grade level, DOK target, and student θ. Zero static question bank.
+
+### Phase B — Deep Evaluation (20-node LangGraph pipeline)
+
+```
+detect_confusion_signal
+  ├─ confused ──► lca_confusion ──► write_report (scaffold + anchor)
+  └─ normal
+       │
+       ▼
+  score_answers ──► chat_to_signal (φ auditor) ──► update_rasch
+       │
+       ▼
+  check_stopping_criterion
+  ├─ SE ≥ 0.30 AND total < 25 ──► generate_follow_up_questions ──► write_report
+  └─ continue
+       │
+       ▼
+  detect_misconceptions ──► lca_misconception ──► update_bkt
+       │
+       ▼
+  consolidate_memory ──► load_exercise_memory ──► identify_and_rank_gaps
+       │
+       ├─ gaps ──► generate_remediation ──► judge_mastery
+       └─ no gaps ──────────────────────►  judge_mastery
+                                               │
+                                               ▼
+                                     apply_fidelity_correction
+                                               │
+                                               ▼
+                                     generate_recommendations
+                                               │
+                                               ▼
+                                     llm_recommendation_decider ──► write_report
+```
+
+---
+
+## Core Features
+
+### Elastic Stopping (Computerized Adaptive Testing)
+
+The pipeline stops asking questions when the Rasch Standard Error drops below the confidence threshold, not after a fixed count.
+
+```
+Stop when:  SE(θ) < 0.30   OR   total_answered ≥ 25
+
+SE(θ) = 1 / √(Σ I(θ, βᵢ))    where I(θ,β) = P(1−P)
+```
+
+If SE ≥ 0.30 after initial questions, the pipeline routes to `generate_follow_up_questions` and returns `needs_more_questions: true` with a fresh question batch. The frontend loops back with `total_answered_prior` to accumulate the count.
+
+---
+
+### Neuro-Symbolic Signal Bridge (φ System)
+
+The central innovation: every student action produces a **Fidelity Factor φ ∈ [−1.0, 1.0]** that the Gemini Dynamic Weight Auditor computes from chat messages, response time, correctness, and DOK level.
+
+| φ value | Signal | Meaning |
+|---------|--------|---------|
+| `+1.0` | Fluent | Explained reasoning correctly — genuine understanding |
+| `+0.7` | Confident | Correct, moderate speed, no hesitation |
+| `+0.5` | Partial | Hesitant ("I think…") or suspiciously fast |
+| `+0.2` | Brittle | Correct in < 3 s on DOK ≥ 2 — likely pattern match |
+| `0.0` | Neutral | Wrong answer — BKT posterior already penalizes |
+| `−0.5` | Struggling | Partial conceptual gap, specific hurdle identified |
+| `−1.0` | Hard Block | "I don't get this" — prerequisite fundamentally missing |
+
+**φ-Modified BKT Formula:**
+
+```
+P(L_{t+1}) = P(L_t | Obs) + (1 − P(L_t | Obs)) × (p_transit × φ)
+```
+
+Negative φ produces un-learning. The standard BKT formula (φ=1) is a special case. Wrong answers cap φ at 0.0 to avoid double-penalizing.
+
+---
+
+### Live Confusion Signal Backprop
+
+If a student sends "I don't get this / why / how" during a session, the signal is captured as `confusion_signal: true` before Phase B scoring begins. The pipeline immediately routes to `lca_confusion` (BFS backward to nearest mastered ancestor) and exits with a scaffold response — skipping the full 20-node evaluation. No wasted scoring on a student who has already disengaged.
+
+---
+
+### Cognitive Load Pruning (TEMPORARY_BLOCK)
+
+When a concept is hard-blocked (φ = −1.0 or prerequisite failed), the system writes `TEMPORARY_BLOCK` relationships in Neo4j for all downstream concepts (1–4 hops forward) to prevent overwhelming the student:
+
+```cypher
+(:Student)-[:TEMPORARY_BLOCK {
+  blocked_by: $hard_blocked_node_id,
+  created_at: datetime()
+}]->(:SFI)
+```
+
+These blocks are automatically removed when the student achieves mastery ≥ 0.65 on the blocking concept during a future exercise session.
+
+---
+
+### Recursive Pivot — Back-and-Forth Adaptation
+
+During live exercise sessions (`/exercise_chat`), φ is computed in real time. When φ < −0.3:
+
+1. **The Back** — LCA agent BFS-traverses the prerequisite graph to find the nearest mastered ancestor (p_mastery ≥ 0.95, up to 6 hops).
+2. **The Bridge** — Gemini generates a 2–3 sentence connecting instruction: "You already know X — here's how that connects to Y."
+3. **The Forth** — Student resumes the original exercise with the bridge as scaffolding.
+
+Every φ < −0.3 event is logged as an immutable **FailureChain** audit record in PostgreSQL.
+
+---
+
+### Fidelity Correction Layer
+
+After `judge_mastery`, the LLM verdict and response-time signals are used to apply a correction to the BKT gain — not the total mastery:
+
+```python
+corrected = p_mastery_before + gain * fidelity_factor
+```
+
+| Condition | Factor |
+|-----------|--------|
+| Mastered verdict + challenge question | 1.2× |
+| Struggling verdict + correct answer | 0.5× |
+| `is_likely_guess` flag set | 0.5× |
+| Default | 1.0× |
+
+This prevents a lucky guess from inflating mastery or a slow-but-correct answer from being penalized.
+
+---
+
+### Per-Standard BKT Parameter Fitting
+
+BKT parameters (p_init, p_transit, p_slip, p_guess) are fit per standard using Baum-Welch EM on historical student response data. Standards with insufficient data fall back to grade-band defaults. Fit parameters are stored in Neo4j and refreshed as more data accumulates.
+
+---
+
+### Exercise Memory & Anti-Repetition
+
+Before generating remediation exercises, the system loads the student's full exercise history per standard from Neo4j (`ATTEMPTED` edges). The remediation prompt receives a memory block showing all previously seen questions and explicitly instructs Gemini to approach the concept from a different angle. Students who have struggled across multiple sessions (< 40% correct) receive more concrete, real-world framings.
+
+---
+
+### AI Tutor
+
+After assessment results load, a Gemini-powered tutor opens automatically. The tutor is grounded in the complete evaluation payload: θ, every gap with mastery probability, misconceptions, remediation exercises, and recommended learning path. Students can ask follow-up questions; the tutor has access to the student's full Neo4j mastery profile for standalone chat sessions.
+
+---
+
+## Knowledge Graph
+
+Neo4j holds **144,733 StandardsFrameworkItem** nodes covering K–12 Mathematics and English Language Arts across all 50 US states plus CCSS Multi-State standards.
+
+### Node & Edge Schema
+
+| Edge type | Meaning | Weight |
+|-----------|---------|--------|
+| `BUILDS_TOWARDS` | Conceptual prerequisite | `conceptual_weight` (0–1) |
+| `PRECEDES` | Ordered sequence | — |
+| `DEFINES_UNDERSTANDING` | Understanding dependency | `understanding_strength` |
+| `HAS_CHILD` | Curriculum cluster | — |
+
+### Student State Edges
+
+```cypher
+(:Student)-[:SKILL_STATE {
+  p_mastery,      // Bayesian posterior P(mastered)
+  p_transit,      // P(learning on next attempt) — fit per standard
+  p_slip,         // P(knows but answers wrong)
+  p_guess,        // P(doesn't know but guesses right)
+  attempts,
+  correct,
+  last_updated
+}]->(:StandardsFrameworkItem)
+
+(:Student)-[:TEMPORARY_BLOCK {
+  blocked_by,     // identifier of the blocking hard concept
+  created_at
+}]->(:StandardsFrameworkItem)
+
+(:Student)-[:ATTEMPTED {
+  question_text,
+  correct,
+  dok_level,
+  session_id,
+  timestamp
+}]->(:StandardsFrameworkItem)
+```
+
+### Edge Weight Learning
+
+`BUILDS_TOWARDS` edge weights are updated after every session using exponential moving average:
+
+```
+new_weight = old_weight × 0.95 + signal × 0.05
+```
+
+where `signal = 1.0` if the downstream concept was mastered after mastering the prerequisite, `0.0` otherwise.
+
+---
+
+## Learning Science
+
+### Rasch 1PL Item Response Theory
+
+```
+P(correct | θ, β) = 1 / (1 + exp(−(θ − β)))
+
+I(θ, β) = P × (1 − P)          // Fisher Information
+SE(θ)   = 1 / √(Σ I(θ, βᵢ))   // Standard Error of θ estimate
+```
+
+θ is updated via Newton-Raphson after each response. Questions are selected to maximize `I(θ,β)` — the engine targets β ≈ θ (50% success probability) for maximum diagnostic signal.
+
+### φ-Modified Bayesian Knowledge Tracing
+
+```
+// Bayesian update on observation:
+P(L | correct) = P(L) × (1 − p_slip) / [P(L)(1−p_slip) + (1−P(L)) × p_guess]
+P(L | wrong)   = P(L) × p_slip       / [P(L) × p_slip + (1−P(L)) × (1−p_guess)]
+
+// φ-modified learning transition:
+P(L_{t+1}) = P(L_t | Obs) + (1 − P(L_t | Obs)) × (p_transit × φ)
+
+// φ < 0 → un-learning (mastery decreases)
+// φ = 1 → standard BKT
+// φ = 0 → no update (wrong answer, BKT posterior already penalized)
+```
+
+### Knowledge Space Theory (KST) Propagation
+
+After scoring, mastery propagates through the prerequisite graph:
+
+- **Forward (success):** child mastery propagates upward → parent mastery × 0.90 per hop
+- **Backward (failure):** parent failure propagates downward → child mastery × 0.70 penalty per hop
+- **Hard block:** prerequisite edge with `conceptual_weight ≥ 0.9` failed → all downstream nodes marked hard-blocked → `TEMPORARY_BLOCK` written to Neo4j
+
+---
+
+## API Reference
+
+### Assessment
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/assessment/generate` | Phase A: IRT selection + GraphRAG + question generation |
+| `POST` | `/api/v1/assessment/evaluate` | Phase B: full 20-node adaptive evaluation pipeline |
+| `POST` | `/api/v1/assessment/exercise_chat` | Live exercise session: φ computation + recursive pivot |
+| `POST` | `/api/v1/assessment/exercise_complete` | Mark exercise done, update Neo4j, unblock if mastered |
+
+### AI Tutor
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/chat/tutor` | Multi-turn chat grounded in a full EvalResult payload |
+| `POST` | `/chat/standalone` | Multi-turn chat grounded in live Neo4j mastery profile |
+| `GET`  | `/chat/context/{student_id}` | Load student mastery profile for standalone tutor |
+
+### `/evaluate` Response Shape
+
+```json
+{
+  "student_id": "student_001",
+  "score": 0.75,
+  "theta": 0.42,
+  "se": 0.28,
+  "total_answered": 10,
+  "needs_more_questions": false,
+  "additional_questions": [],
+  "gaps": [...],
+  "misconceptions": [...],
+  "remediation_plan": [...],
+  "recommendations": [...],
+  "lca_safety_nets": {},
+  "newly_blocked_nodes": [],
+  "mastery_verdicts": {},
+  "llm_decisions": {}
+}
+```
+
+### `/exercise_chat` Response Shape
+
+```json
+{
+  "phi": -0.5,
+  "reason": "Student expressed confusion about regrouping",
+  "gap_tag": "regrouping",
+  "p_mastery_before": 0.72,
+  "p_mastery_after": 0.31,
+  "pivot_needed": true,
+  "pivot_node": { "code": "2.NBT.A.1", "description": "...", "hops": 2 },
+  "bridge_instruction": "You already know how to count tens — let's use that..."
+}
+```
+
+### Example: Generate an Assessment
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assessment/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "student_id": "student_001",
+    "grade": "3",
+    "subject": "math",
+    "state_jurisdiction": "TX"
+  }'
+```
+
+### Example: Submit Answers
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assessment/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "student_id": "student_001",
+    "grade": "3",
+    "subject": "math",
+    "state_jurisdiction": "TX",
+    "answers": {"<question_id>": "A"},
+    "questions": [...],
+    "confusion_signal": false,
+    "total_answered_prior": 0
+  }'
+```
+
+---
+
+## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.11, FastAPI, LangGraph |
 | AI | Google Gemini (gemini-2.5-pro / gemini-2.0-flash) via Vertex AI |
-| Knowledge graph | Neo4j 5 |
-| Relational DB | PostgreSQL 15 |
+| Knowledge graph | Neo4j 5 — 144,733 curriculum nodes |
+| Relational DB | PostgreSQL 15 — sessions, failure chains, audit log |
 | Frontend | Next.js 14, TypeScript, TailwindCSS |
 | Infrastructure | Docker Compose |
 
 ---
 
-## Quick start
+## Quick Start
 
 ### Prerequisites
 
@@ -72,7 +409,7 @@ Student mastery is stored on `SKILL_STATE` edges between `Student` nodes and `St
 git clone <repo>
 cd adaptive-learning-engine
 cp .env.example .env
-# Fill in GEMINI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
+# Fill in: GEMINI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, POSTGRES_URL
 ```
 
 ### 2. Start databases
@@ -96,89 +433,11 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000
+Open [http://localhost:3000](http://localhost:3000)
 
 ---
 
-## API reference
-
-### Assessment
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/v1/assessment/generate` | Phase A: select standards + generate questions |
-| `POST` | `/api/v1/assessment/evaluate` | Phase B: score + BKT + KST + gaps + remediation + recommendations |
-
-### AI Tutor
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/chat/tutor` | Multi-turn chat grounded in a full EvalResult payload |
-| `POST` | `/chat/standalone` | Multi-turn chat grounded in live Neo4j mastery profile |
-| `GET`  | `/chat/context/{student_id}` | Load student mastery profile for standalone tutor |
-
-### Example: generate an assessment
-
-```bash
-curl -X POST http://localhost:8000/api/v1/assessment/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_id": "student_001",
-    "grade": "3",
-    "subject": "math",
-    "state_jurisdiction": "TX"
-  }'
-```
-
-### Example: submit answers
-
-```bash
-curl -X POST http://localhost:8000/api/v1/assessment/evaluate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_id": "student_001",
-    "grade": "3",
-    "subject": "math",
-    "state_jurisdiction": "TX",
-    "answers": {"<question_id>": "A", ...},
-    "questions": [...]
-  }'
-```
-
----
-
-## Learning science
-
-### Rasch 1PL Item Response Theory
-
-Every question has a difficulty parameter β (logit scale). The student's latent ability is θ. The probability of a correct answer is:
-
-```
-P(correct | θ, β) = 1 / (1 + exp(-(θ - β)))
-```
-
-Fisher Information is maximized when θ ≈ β (50% success probability), so the engine selects questions with β closest to the student's current θ to get the most diagnostic signal per question.
-
-### Bayesian Knowledge Tracing (BKT)
-
-Parameters: P_init=0.10, P_learn=0.20, P_slip=0.10, P_guess=0.20
-
-```
-P(L | correct) = P(L)*(1-slip) / [P(L)*(1-slip) + (1-P(L))*guess]
-P(L | wrong)   = P(L)*slip     / [P(L)*slip     + (1-P(L))*(1-guess)]
-P(L_next)      = P(L|obs) + (1 - P(L|obs)) * P_learn
-```
-
-### Knowledge Space Theory (KST) propagation
-
-After scoring, mastery propagates through the prerequisite graph:
-- **Success propagates forward** (child→parent): mastery * 0.90 decay per hop
-- **Failure propagates backward** (parent→child): mastery * 0.70 penalty per hop
-- **Hard block**: if a prerequisite edge has `conceptual_weight >= 0.9` and the student failed, all downstream nodes are marked hard-blocked
-
----
-
-## Environment variables
+## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
@@ -193,36 +452,43 @@ After scoring, mastery propagates through the prerequisite graph:
 
 ---
 
-## Project structure
+## Project Structure
 
 ```
 adaptive-learning-engine/
 ├── backend/
 │   └── app/
 │       ├── agents/
+│       │   ├── orchestrator.py          # LangGraph pipeline — Phase A + Phase B wiring
 │       │   ├── assessment_agent.py      # Phase A: IRT selection + GraphRAG + generation
-│       │   ├── evaluation_agent.py      # Phase B: scoring, Rasch, BKT, misconceptions
-│       │   ├── gap_agent.py             # KST propagation + gap ranking
-│       │   ├── remediation_agent.py     # Gap exercise generation
+│       │   ├── evaluation_agent.py      # Phase B: scoring, Rasch, φ-BKT, misconceptions
+│       │   ├── adaptive_agents.py       # Elastic stopping, confusion signal, LCA, follow-up Qs
+│       │   ├── signal_bridge.py         # Neuro-symbolic φ system + recursive pivot
+│       │   ├── gap_agent.py             # KST propagation, gap ranking, TEMPORARY_BLOCK
+│       │   ├── remediation_agent.py     # NanoPoint-tagged exercise generation
 │       │   ├── recommendation_agent.py  # ZPD frontier + learning path
-│       │   ├── orchestrator.py          # LangGraph pipeline wiring
-│       │   ├── irt_selector.py          # Fisher Information ranking
-│       │   ├── rasch.py                 # Rasch 1PL model
-│       │   ├── bkt.py                   # Bayesian Knowledge Tracing
-│       │   ├── kst.py                   # Knowledge Space Theory
-│       │   └── vertex_llm.py            # Gemini client (GenAI + Vertex fallback)
+│       │   ├── metacognitive_agent.py   # LLM mastery judge + fidelity correction
+│       │   ├── memory_agent.py          # Session memory consolidation
+│       │   ├── lca_agent.py             # BFS backward to nearest mastered ancestor
+│       │   └── vertex_llm.py            # Gemini client (GenAI + Vertex AI fallback)
 │       ├── api/routes/
-│       │   ├── assessment.py            # /generate + /evaluate endpoints
+│       │   ├── assessment.py            # /generate, /evaluate, /exercise_chat, /exercise_complete
 │       │   └── chat.py                  # AI tutor endpoints
-│       ├── agent/state.py               # LangGraph AssessmentState schema
-│       ├── db/models/                   # SQLAlchemy ORM models
+│       ├── agent/state.py               # LangGraph AssessmentState — all 30+ fields
+│       ├── student/
+│       │   ├── rasch_engine.py          # Rasch 1PL + Newton-Raphson θ update
+│       │   ├── bayesian_tracker.py      # φ-modified BKT per-standard update
+│       │   └── bkt_fitter.py            # Baum-Welch EM parameter fitting
+│       ├── db/models/
+│       │   ├── chat.py                  # FailureChain + ChatSession ORM models
+│       │   └── __init__.py
 │       └── core/settings.py             # Pydantic settings
 ├── frontend/
 │   └── app/
-│       └── assessment/page.tsx          # Single-page assessment + chat UI
+│       └── assessment/page.tsx          # Assessment UI + tutor chat + parent dashboard
 ├── infra/
 │   └── compose.yaml                     # Neo4j + PostgreSQL
-└── ARCHITECTURE.md                      # Full system architecture reference
+└── ARCHITECTURE.md                      # Full system design reference
 ```
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the complete system design including all Neo4j node labels, relationship types, PostgreSQL schema, and the full LangGraph pipeline.
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the complete system design including all Neo4j schemas, PostgreSQL tables, the full 20-node Phase B pipeline, and the φ signal reference table.
