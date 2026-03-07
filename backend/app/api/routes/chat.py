@@ -446,6 +446,185 @@ async def chat_with_tutor(body: TutorRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+class ParentSummaryRequest(BaseModel):
+    student_id: str
+    child_name: str = ""
+    grade: str = "all"
+    subject: str = "math"
+    mastery_context: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/parent_summary", summary="Generate a parent-friendly progress summary")
+async def parent_summary(body: ParentSummaryRequest) -> dict[str, Any]:
+    """
+    Translates technical assessment/mastery data into plain-English language
+    that a parent or guardian can understand and act on.
+
+    No jargon, no acronyms, no probability numbers — just clear explanations
+    of what the child can do, what they need to work on, and how parents can help.
+    Returns a structured JSON object + opens a parent-friendly AI chat session.
+    """
+    import asyncio
+    from backend.app.agents.vertex_llm import get_llm
+
+    ctx = body.mastery_context
+    child = body.child_name or f"your child ({body.student_id})"
+    subject_name = "Mathematics" if body.subject.lower() == "math" else "English Language Arts"
+    grade_label  = f"Grade {body.grade.replace('K','')}" if body.grade != "all" else "K-8"
+
+    gaps      = ctx.get("gaps", []) or []
+    strengths = ctx.get("strengths", []) or []
+    mean_m    = ctx.get("mean_mastery")
+    assessed  = ctx.get("total_assessed", 0)
+
+    if not assessed:
+        return {
+            "has_data": False,
+            "headline": f"No assessments completed yet for {child}.",
+            "performance_summary": f"{child} hasn't completed any assessments yet. Have them take an adaptive assessment to see a full report here.",
+            "overall_status": "not_started",
+            "strengths": [],
+            "focus_areas": [],
+            "next_milestone": "",
+            "encouragement": "Every learning journey starts with a first step!",
+        }
+
+    gap_lines = []
+    for g in gaps[:6]:
+        code = g.get("code", "")
+        desc = g.get("description", "")
+        m    = round((g.get("mastery", 0) or 0) * 100)
+        gap_lines.append(f"  - {desc} (standard {code}, mastery {m}%)")
+
+    strength_lines = []
+    for s in strengths[:6]:
+        desc = s.get("description", "")
+        m    = round((s.get("mastery", 0) or 0) * 100)
+        strength_lines.append(f"  - {desc} (mastery {m}%)")
+
+    mean_pct = round((mean_m or 0) * 100)
+
+    prompt = f"""You are writing a progress report for a parent or guardian — NOT a teacher or educational expert.
+
+Child: {child}
+Grade: {grade_label}
+Subject: {subject_name}
+Overall mastery across {assessed} assessed skills: {mean_pct}%
+
+What the child is doing WELL:
+{chr(10).join(strength_lines) if strength_lines else "  - Not enough data yet"}
+
+Areas that need more practice:
+{chr(10).join(gap_lines) if gap_lines else "  - No major gaps detected"}
+
+Write this report as if you are a warm, experienced teacher writing a note home to parents.
+Rules:
+- Use simple, clear language. No acronyms. No technical terms.
+- Convert "mastery probability" to plain language like "is getting comfortable with" or "needs more practice with"
+- Make focus areas sound like opportunities, not failures
+- Be specific and actionable — tell parents exactly what they can do
+- Keep each section short and easy to read
+
+Return a JSON object with these exact keys:
+{{
+  "has_data": true,
+  "overall_status": "doing_great|on_track|needs_support",
+  "headline": "<one upbeat sentence about the child's overall progress>",
+  "performance_summary": "<2-3 plain English sentences about how they did overall>",
+  "strengths": [
+    {{"topic": "<plain English topic name>", "detail": "<1 sentence of what they can do well>"}}
+  ],
+  "focus_areas": [
+    {{
+      "topic": "<plain English topic name>",
+      "plain_explanation": "<1-2 sentences explaining what they struggle with and why it matters>",
+      "severity": "minor|moderate|significant",
+      "home_activity": "<1 specific, fun activity parents can do at home to help>"
+    }}
+  ],
+  "next_milestone": "<what the child will be ready to do once they improve these areas>",
+  "encouragement": "<1 warm, specific sentence celebrating the child's effort or progress>"
+}}"""
+
+    llm = get_llm()
+    loop = asyncio.get_event_loop()
+
+    try:
+        raw = await loop.run_in_executor(None, lambda: llm.generate_json(prompt))
+        if isinstance(raw, dict):
+            raw["has_data"] = True
+            return raw
+    except Exception as exc:
+        logger.warning(f"Parent summary LLM failed: {exc}")
+
+    # Fallback structured response
+    status = "doing_great" if mean_pct >= 75 else "on_track" if mean_pct >= 55 else "needs_support"
+    return {
+        "has_data": True,
+        "overall_status": status,
+        "headline": f"{child} is making progress in {grade_label} {subject_name}.",
+        "performance_summary": f"{child} has been assessed on {assessed} skills in {subject_name} with an average mastery of {mean_pct}%.",
+        "strengths": [{"topic": s.get("description", "")[:50], "detail": "Showing strong understanding."} for s in strengths[:3]],
+        "focus_areas": [{"topic": g.get("description", "")[:50], "plain_explanation": "This area needs more practice.", "severity": "moderate", "home_activity": "Practice this concept together for 10 minutes a day."} for g in gaps[:3]],
+        "next_milestone": "Continued practice will unlock more advanced concepts.",
+        "encouragement": f"Keep up the great work, {child}!",
+    }
+
+
+@router.post("/parent", summary="Parent-focused AI tutor chat")
+async def parent_chat(body: "StandaloneTutorRequest") -> dict[str, Any]:
+    """
+    Multi-turn AI chat for parents — grounded in the child's mastery data
+    but explained in parent-friendly language. No jargon.
+    """
+    import asyncio
+    from backend.app.agents.vertex_llm import get_llm
+
+    ctx = body.mastery_context
+    child = body.student_id
+    subject_name = "Mathematics" if body.subject.lower() == "math" else "English Language Arts"
+    grade_label  = f"Grade {body.grade.replace('K','')}" if body.grade != "all" else "K-8"
+
+    gaps_text = "\n".join(
+        f"  - {g.get('description','')} (needs more practice)"
+        for g in (ctx.get("gaps") or [])[:5]
+    )
+    strengths_text = "\n".join(
+        f"  - {s.get('description','')} (doing well)"
+        for s in (ctx.get("strengths") or [])[:5]
+    )
+
+    system = f"""You are a warm, knowledgeable educational advisor speaking with the parent or guardian of {child}, a {grade_label} {subject_name} student.
+
+Your job is to help parents understand their child's learning and give them practical, actionable advice.
+
+Child's current status:
+- Strengths: {strengths_text or "Insufficient data — encourage them to complete an assessment"}
+- Areas to focus on: {gaps_text or "No major gaps identified"}
+
+Rules:
+- Use simple, parent-friendly language. No educational jargon, no acronyms.
+- Be warm, encouraging, and solution-focused.
+- When parents ask what they can do at home, give specific, fun, practical activities.
+- When explaining a learning gap, explain WHY it matters in real-world terms.
+- Keep answers focused and conversational — this is a chat, not a lecture.
+- If asked about severity, be honest but reassuring."""
+
+    history = [{"role": m.role, "content": m.content} for m in body.history]
+    llm  = get_llm()
+    loop = asyncio.get_event_loop()
+
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: llm.chat(system=system, history=history, message=body.message, model=CHAT_MODEL),
+        )
+        return {"role": "assistant", "content": response.strip(), "model": CHAT_MODEL}
+    except Exception as exc:
+        logger.error(f"Parent chat failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 class StandaloneTutorRequest(BaseModel):
     student_id: str = "default"
     grade: str = "all"
