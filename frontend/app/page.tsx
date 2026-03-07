@@ -10,7 +10,7 @@ export default function HomePage() {
           <span className="text-white text-2xl font-bold">L</span>
         </div>
         <h1 className="text-4xl font-bold text-slate-900 mb-3 tracking-tight">
-          Welcome to Lumina
+          Welcome to Evlin
         </h1>
         <p className="text-slate-500 text-lg">
           Adaptive learning that meets every student exactly where they are.

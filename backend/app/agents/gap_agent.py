@@ -172,6 +172,8 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
                     "grade": grade_list[0] if grade_list else "",
                     "downstream_count": r["downstream_count"] or 0,
                 }
+    except Exception as exc:
+        logger.warning(f"identify_and_rank_gaps Neo4j query failed (continuing with empty edges): {exc}")
     finally:
         driver.close()
 

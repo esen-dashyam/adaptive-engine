@@ -219,10 +219,10 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
     - Vertex AI targeted remediation exercises per gap
     - Personalised learning path recommendations (ZPD frontier)
     """
-    from backend.app.agents.orchestrator import get_phase_b
-    from backend.app.agent.state import AssessmentState
-
     try:
+        from backend.app.agents.orchestrator import get_phase_b
+        from backend.app.agent.state import AssessmentState
+
         logger.info("═" * 60)
         logger.info(f"  ▶ PHASE B START │ student={body.student_id}  grade={body.grade}  answers={len(body.answers)}")
         logger.info("═" * 60)
@@ -311,8 +311,10 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
             "results":           final.results,
         }
     except Exception as exc:
-        logger.error(f"Assessment evaluation failed: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Assessment evaluation failed: {type(exc).__name__}: {exc}\n{tb}")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}" or "Evaluation pipeline error")
 
 
 @router.post("/exercise_complete", summary="Submit a single exercise result — updates BKT and KG edge weights")

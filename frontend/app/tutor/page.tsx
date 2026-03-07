@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { useSearchParams } from "next/navigation";
 
 const API = "/api/v1";
 
@@ -98,9 +99,10 @@ function TypingIndicator() {
 }
 
 export default function TutorPage() {
-  const [studentId, setStudentId] = useState("student_001");
-  const [grade, setGrade]         = useState("all");
-  const [subject, setSubject]     = useState("all");
+  const searchParams = useSearchParams();
+  const [studentId, setStudentId] = useState(searchParams.get("student_id") || "student_001");
+  const [grade, setGrade]         = useState(searchParams.get("grade") ? `K${searchParams.get("grade")}` : "all");
+  const [subject, setSubject]     = useState(searchParams.get("subject") || "all");
 
   const [messages, setMessages]         = useState<Message[]>([]);
   const [input, setInput]               = useState("");
@@ -137,6 +139,20 @@ export default function TutorPage() {
   useEffect(() => {
     loadContext(studentId, grade, subject);
   }, [studentId, grade, subject, loadContext]);
+
+  // Auto-start conversation when coming from an assessment
+  const didAutoStart = useRef(false);
+  useEffect(() => {
+    if (didAutoStart.current) return;
+    if (searchParams.get("student_id") && mastery !== null && messages.length === 0) {
+      didAutoStart.current = true;
+      sendMessage(
+        "I just finished my assessment. Tell me: what did I do well, " +
+        "what are my biggest gaps, and what should I work on first? Keep it encouraging and simple."
+      );
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mastery]);
 
   async function sendMessage(override?: string) {
     const text = (override ?? input).trim();

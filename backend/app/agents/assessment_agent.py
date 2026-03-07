@@ -111,6 +111,7 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
                       AND ANY(g IN n.gradeLevelList WHERE g = $grade)
                       AND n.normalizedStatementType = 'Standard'
                       AND NOT (n.statementCode STARTS WITH 'MP')
+                      AND NOT (n.statementCode CONTAINS '.MP')
                       AND size(n.description) > 20
                     RETURN n.identifier AS identifier,
                            n.statementCode AS code,
@@ -346,6 +347,7 @@ Rules:
 5. Exactly 4 options (A, B, C, D) with ONE correct answer
 6. Questions should match the student's ability: θ={state.theta:+.2f} (0=average, positive=strong, negative=struggling)
 7. Do NOT repeat any stems listed under AVOID above
+8. CRITICAL: Do NOT generate questions that require a visual, image, diagram, line plot, chart, table, or any graphic that cannot be displayed as plain text. Every question must be 100% self-contained in words and numbers only. If a standard normally uses visuals (e.g. line plots, bar charts, geometric figures), write a word-problem version instead.
 
 Return ONLY a valid JSON array. Each element must be:
 {{"id":"<uuid>","type":"multiple_choice","question":"<text>","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","dok_level":1,"category":"prerequisite|target","standard_code":"<code>","node_index":<int>}}"""

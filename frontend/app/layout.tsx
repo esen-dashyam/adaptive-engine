@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Lumina Learning",
+  title: "Evlin Learning",
   description: "Adaptive K1-K8 learning powered by AI",
 };
 
@@ -16,7 +16,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <div className="w-7 h-7 bg-indigo-600 rounded-lg flex items-center justify-center">
                 <span className="text-white text-xs font-bold">L</span>
               </div>
-              <span className="font-bold text-slate-900 text-base tracking-tight">Lumina</span>
+              <span className="font-bold text-slate-900 text-base tracking-tight">Evlin</span>
             </a>
             <div className="flex items-center gap-1 text-sm">
               <a href="/assessment"

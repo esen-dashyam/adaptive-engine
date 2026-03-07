@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 const API = "/api/v1";
 
@@ -65,15 +66,9 @@ const STATUS_COLOR: Record<string, string> = {
   below: "text-red-700 bg-red-50 border-red-200",
 };
 
-const CHAT_PROMPTS = [
-  "What should I focus on this week?",
-  "Walk me through one of my wrong answers.",
-  "Give me a practice problem for my weakest area.",
-  "How close am I to the next level?",
-  "Explain why this concept matters.",
-];
 
 export default function AssessmentPage() {
+  const router = useRouter();
   const [step, setStep]           = useState<"config" | "taking" | "results">("config");
   const [studentId, setStudentId] = useState("student_001");
   const [childName, setChildName] = useState("");
@@ -85,30 +80,7 @@ export default function AssessmentPage() {
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [answers, setAnswers]     = useState<Record<string, string>>({});
   const [results, setResults]     = useState<EvalResult | null>(null);
-  const [activeTab, setActiveTab] = useState(0);
   const [geminiError, setGeminiError] = useState(false);
-  const [chatMessages, setChatMessages] = useState<{ role: string; content: string }[]>([]);
-  const [chatInput, setChatInput] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
-  const [showDetails, setShowDetails] = useState(false);
-  const chatEndRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatMessages]);
-
-  useEffect(() => {
-    if (step === "results" && results && chatMessages.length === 0) {
-      sendChatMessage(
-        "Analyse my assessment results. Tell me: (1) what my score means, " +
-        "(2) the 2-3 most important things I need to work on and why, " +
-        "(3) one concrete first step I can take right now. " +
-        "Be encouraging, specific, and use simple language.",
-        true
-      );
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, results]);
 
   async function startAssessment() {
     setLoading(true); setError(null); setGeminiError(false);
@@ -152,38 +124,26 @@ export default function AssessmentPage() {
         body: JSON.stringify({ assessment_id: assessment.assessment_id, student_id: studentId, grade, subject, state, answers: payload }),
       });
       if (!res.ok) {
-        let d = "Evaluation failed";
-        try { const b = await res.json(); d = b?.detail || d; } catch {}
+        let d = `Evaluation failed (HTTP ${res.status})`;
+        try {
+          const b = await res.json();
+          if (b?.detail) d = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail);
+        } catch {}
         throw new Error(d);
       }
       const data: EvalResult = await res.json();
-      setResults(data); setChatMessages([]); setStep("results");
+      setResults(data); setStep("results");
     } catch (e: any) { setError(e.message); }
     finally { setLoading(false); }
   }
 
-  async function sendChatMessage(override?: string, silent?: boolean) {
-    const msg = (override ?? chatInput).trim();
-    if (!msg || !results) return;
-    if (!silent) setChatMessages(p => [...p, { role: "user", content: msg }]);
-    setChatInput(""); setChatLoading(true);
-    try {
-      const res = await fetch(`${API}/chat/tutor`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          student_id: studentId, grade, subject,
-          message: msg,
-          history: silent ? [] : chatMessages,
-          context: results,
-        }),
-      });
-      if (!res.ok) throw new Error("Chat unavailable");
-      const data = await res.json();
-      setChatMessages(p => [...p, { role: "assistant", content: data.content }]);
-    } catch (e: any) {
-      setChatMessages(p => [...p, { role: "assistant", content: "I'm having trouble connecting. Please try again." }]);
-    } finally { setChatLoading(false); }
+  function goToTutor() {
+    const params = new URLSearchParams({
+      student_id: studentId,
+      grade: grade.replace("K", ""),
+      subject,
+    });
+    router.push(`/tutor?${params.toString()}`);
   }
 
   const answered = Object.keys(answers).length;
@@ -337,196 +297,78 @@ export default function AssessmentPage() {
   if (step === "results" && results) {
     const scorePct = Math.round(results.score * 100);
     const name = childName || studentId;
+    const circumference = 2 * Math.PI * 40;
 
     return (
-      <div className="max-w-2xl mx-auto space-y-4">
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold text-slate-900">
-            {name}&apos;s Results
-          </h1>
-          <button onClick={() => { setStep("config"); setResults(null); setAssessment(null); setChatMessages([]); }}
-            className="text-sm text-indigo-600 hover:underline font-medium">
-            New assessment
+      <div className="max-w-xl mx-auto flex flex-col items-center justify-center min-h-[70vh] space-y-6 text-center">
+
+        {/* Score ring */}
+        <div className="relative w-40 h-40">
+          <svg className="w-40 h-40 -rotate-90" viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="40" stroke="#e2e8f0" strokeWidth="10" fill="none" />
+            <circle cx="50" cy="50" r="40" stroke="#6366f1" strokeWidth="10" fill="none"
+              strokeDasharray={circumference}
+              strokeDashoffset={circumference * (1 - scorePct / 100)}
+              strokeLinecap="round"
+              style={{ transition: "stroke-dashoffset 1s ease" }}
+            />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span className="text-4xl font-bold text-slate-900">{scorePct}%</span>
+            <span className="text-xs text-slate-400 mt-0.5">{results.correct}/{results.total}</span>
+          </div>
+        </div>
+
+        {/* Status badge */}
+        <div>
+          <div className={`inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-full border mb-3 ${STATUS_COLOR[results.grade_status] ?? "text-slate-600 bg-slate-50 border-slate-200"}`}>
+            <span className="w-2 h-2 rounded-full bg-current opacity-70" />
+            {STATUS_LABEL[results.grade_status] ?? results.grade_status}
+          </div>
+          <h1 className="text-2xl font-bold text-slate-900 mb-2">Assessment Complete</h1>
+          <p className="text-slate-500 text-sm max-w-sm mx-auto leading-relaxed">
+            {results.session_narrative ||
+              `You answered ${results.correct} of ${results.total} questions correctly.`}
+          </p>
+          {results.focus_concept && (
+            <p className="text-xs text-indigo-600 mt-2 font-medium">
+              Focus next: {results.focus_concept}
+            </p>
+          )}
+        </div>
+
+        {/* Quick stats */}
+        <div className="grid grid-cols-3 gap-3 w-full">
+          {[
+            { label: "Gaps found", value: results.gap_count ?? 0, color: "text-red-600" },
+            { label: "Mastery updates", value: results.bkt_updates?.length ?? 0, color: "text-indigo-600" },
+            { label: "Exercises ready", value: results.gap_exercises?.length ?? 0, color: "text-emerald-600" },
+          ].map(({ label, value, color }) => (
+            <div key={label} className="bg-white border border-slate-200 rounded-xl p-3">
+              <p className={`text-xl font-bold ${color}`}>{value}</p>
+              <p className="text-xs text-slate-400 mt-0.5">{label}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* CTA */}
+        <div className="w-full space-y-3">
+          <button
+            onClick={goToTutor}
+            className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-bold text-base hover:bg-indigo-700 transition-colors flex items-center justify-center gap-3 shadow-md shadow-indigo-200"
+          >
+            <span>Talk to your AI Tutor</span>
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <button
+            onClick={() => { setStep("config"); setResults(null); setAssessment(null); }}
+            className="w-full py-3 rounded-2xl text-slate-500 text-sm font-medium border border-slate-200 hover:bg-slate-50 transition-colors"
+          >
+            Take another assessment
           </button>
         </div>
-
-        {/* Score card */}
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 flex items-center gap-5">
-          <div className="relative w-20 h-20 flex-shrink-0">
-            <svg className="w-20 h-20 -rotate-90" viewBox="0 0 80 80">
-              <circle cx="40" cy="40" r="32" stroke="#e2e8f0" strokeWidth="8" fill="none" />
-              <circle cx="40" cy="40" r="32" stroke="#6366f1" strokeWidth="8" fill="none"
-                strokeDasharray={`${2 * Math.PI * 32}`}
-                strokeDashoffset={`${2 * Math.PI * 32 * (1 - scorePct / 100)}`}
-                strokeLinecap="round" />
-            </svg>
-            <div className="absolute inset-0 flex items-center justify-center">
-              <span className="text-lg font-bold text-slate-900">{scorePct}%</span>
-            </div>
-          </div>
-          <div className="flex-1">
-            <div className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full border mb-2 ${STATUS_COLOR[results.grade_status] ?? "text-slate-600 bg-slate-50 border-slate-200"}`}>
-              <span className="w-1.5 h-1.5 rounded-full bg-current opacity-60" />
-              {STATUS_LABEL[results.grade_status] ?? results.grade_status}
-            </div>
-            <p className="text-slate-700 text-sm leading-relaxed">
-              {results.correct} out of {results.total} correct.
-              {results.session_narrative ? ` ${results.session_narrative}` : ""}
-            </p>
-            {results.focus_concept && (
-              <p className="text-xs text-indigo-600 mt-1.5 font-medium">Focus: {results.focus_concept}</p>
-            )}
-          </div>
-        </div>
-
-        {/* AI Chat */}
-        <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
-          <div className="px-4 py-3 border-b border-slate-100 flex items-center gap-3">
-            <div className="w-8 h-8 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center text-white text-xs font-bold">AI</div>
-            <div>
-              <p className="text-sm font-semibold text-slate-900">Your AI Tutor</p>
-              <p className="text-xs text-slate-400">Gemini · personalised to your results</p>
-            </div>
-            {chatLoading && (
-              <div className="ml-auto flex gap-1">
-                {[0, 150, 300].map(d => (
-                  <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="h-[420px] overflow-y-auto p-4 space-y-4 bg-slate-50">
-            {chatMessages.length === 0 && chatLoading && (
-              <div className="flex items-start gap-2.5">
-                <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full flex items-center justify-center text-white text-xs flex-shrink-0">AI</div>
-                <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 flex gap-1.5 items-center shadow-sm">
-                  {[0, 150, 300].map(d => <span key={d} className="w-2 h-2 bg-slate-300 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
-                </div>
-              </div>
-            )}
-
-            {chatMessages.map((m, i) => (
-              <div key={i} className={`flex gap-2.5 ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                {m.role === "assistant" && (
-                  <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full flex items-center justify-center text-white text-xs flex-shrink-0 mt-0.5">AI</div>
-                )}
-                <div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
-                  m.role === "user" ? "bg-indigo-600 text-white rounded-tr-sm" : "bg-white border border-slate-200 text-slate-800 rounded-tl-sm shadow-sm"
-                }`}>{m.content}</div>
-                {m.role === "user" && (
-                  <div className="w-7 h-7 bg-slate-200 rounded-full flex items-center justify-center text-slate-600 text-xs font-bold flex-shrink-0 mt-0.5">
-                    {name.charAt(0).toUpperCase()}
-                  </div>
-                )}
-              </div>
-            ))}
-
-            {chatLoading && chatMessages.length > 0 && (
-              <div className="flex items-start gap-2.5">
-                <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full flex items-center justify-center text-white text-xs flex-shrink-0">AI</div>
-                <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 flex gap-1.5 shadow-sm">
-                  {[0, 150, 300].map(d => <span key={d} className="w-2 h-2 bg-slate-300 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
-                </div>
-              </div>
-            )}
-            <div ref={chatEndRef} />
-          </div>
-
-          {chatMessages.length >= 1 && !chatLoading && (
-            <div className="px-3 py-2 border-t border-slate-100 bg-white flex gap-2 overflow-x-auto">
-              {CHAT_PROMPTS.map(p => (
-                <button key={p} onClick={() => sendChatMessage(p)}
-                  className="flex-shrink-0 text-xs px-3 py-1.5 rounded-full border border-slate-200 text-slate-500 hover:bg-indigo-50 hover:text-indigo-700 hover:border-indigo-200 transition-colors">
-                  {p}
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div className="p-3 border-t border-slate-100 bg-white flex gap-2">
-            <input value={chatInput} onChange={e => setChatInput(e.target.value)}
-              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChatMessage(); } }}
-              placeholder="Ask anything about your results…"
-              disabled={chatLoading}
-              className="flex-1 border border-slate-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50 disabled:opacity-50" />
-            <button onClick={() => sendChatMessage()} disabled={chatLoading || !chatInput.trim()}
-              className="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-semibold hover:bg-indigo-700 disabled:opacity-40 transition-colors">
-              Send
-            </button>
-          </div>
-        </div>
-
-        {/* Details toggle */}
-        <button onClick={() => setShowDetails(v => !v)}
-          className="w-full text-xs text-slate-400 hover:text-slate-600 py-2 flex items-center justify-center gap-1 transition-colors">
-          {showDetails ? "▲ Hide" : "▼ Show"} full report (exercises, gaps, recommendations)
-        </button>
-
-        {showDetails && (
-          <div className="space-y-4">
-            {/* Practice exercises */}
-            {results.gap_exercises?.length > 0 && (
-              <div className="bg-white rounded-2xl border border-slate-200 p-5">
-                <h3 className="font-semibold text-slate-900 text-sm mb-3">Practice Exercises</h3>
-                <div className="flex gap-2 overflow-x-auto pb-2 mb-3">
-                  {results.gap_exercises.map((p: any, i: number) => (
-                    <button key={i} onClick={() => setActiveTab(i)}
-                      className={`flex-shrink-0 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
-                        activeTab === i ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                      }`}>
-                      {p.standard_code || `Exercise ${i + 1}`}
-                    </button>
-                  ))}
-                </div>
-                {(() => {
-                  const plan = results.gap_exercises[activeTab];
-                  if (!plan) return null;
-                  return (
-                    <div className="space-y-3">
-                      {plan.concept_explanation && (
-                        <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3 text-sm text-indigo-800">
-                          <span className="font-medium">Concept: </span>{plan.concept_explanation}
-                        </div>
-                      )}
-                      {(plan.exercises || []).map((ex: any, j: number) => (
-                        <div key={j} className="border border-slate-200 rounded-xl p-4 space-y-2">
-                          <div className="flex items-center gap-2">
-                            <span className="w-6 h-6 bg-slate-900 text-white rounded-full flex items-center justify-center text-xs font-bold">{j + 1}</span>
-                          </div>
-                          <p className="text-sm text-slate-900 font-medium">{ex.question}</p>
-                          {ex.hint && <p className="text-xs text-amber-700 bg-amber-50 rounded-lg p-2"><span className="font-medium">Hint: </span>{ex.hint}</p>}
-                          {ex.answer && <p className="text-xs text-emerald-700 bg-emerald-50 rounded-lg p-2"><span className="font-medium">Answer: </span>{ex.answer}</p>}
-                        </div>
-                      ))}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-
-            {/* Recommendations */}
-            {results.recommendations?.length > 0 && (
-              <div className="bg-white rounded-2xl border border-slate-200 p-5">
-                <h3 className="font-semibold text-slate-900 text-sm mb-3">What to Learn Next</h3>
-                <div className="space-y-2">
-                  {results.recommendations.map((r: any, i: number) => (
-                    <div key={i} className="flex items-start gap-3 p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm">
-                      <span className="w-6 h-6 rounded-full bg-white border border-slate-300 flex items-center justify-center text-xs font-bold text-slate-600 flex-shrink-0">{r.rank ?? i + 1}</span>
-                      <div>
-                        <p className="font-medium text-slate-900 text-xs">{r.standard_code}</p>
-                        <p className="text-slate-500 text-xs mt-0.5 leading-relaxed">{r.description}</p>
-                        {r.why_now && <p className="text-indigo-600 text-xs mt-1 italic">{r.why_now}</p>}
-                        {r.decision_reasoning && <p className="text-slate-400 text-xs mt-1">{r.decision_reasoning}</p>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
       </div>
     );
   }

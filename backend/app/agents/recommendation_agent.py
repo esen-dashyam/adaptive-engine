@@ -86,6 +86,8 @@ def generate_recommendations(state: AssessmentState) -> dict:
                     grade_list = row.get("grade_list") or []
                     row["grade"] = grade_list[0] if grade_list else ""
                     node_details[row["identifier"]] = row
+    except Exception as exc:
+        logger.warning(f"generate_recommendations Neo4j query failed (continuing): {exc}")
     finally:
         driver.close()
 
