@@ -52,6 +52,22 @@ class AnswerSubmission(BaseModel):
     )
 
 
+class ExerciseResultRequest(BaseModel):
+    """Single exercise completion — updates BKT and KG edge weights in real-time."""
+    student_id: str
+    standard_code: str
+    node_identifier: str        # Neo4j identifier for the StandardsFrameworkItem
+    exercise_id: str            # the question id from the remediation plan
+    question_text: str = ""
+    correct: bool
+    selected_answer: str = ""
+    correct_answer: str = ""
+    dok_level: int = 2
+    question_type: str = "practice"
+    difficulty_beta: float = 0.0
+    session_id: str | None = None
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _load_student_theta(student_id: str) -> float:
@@ -287,11 +303,259 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
             "bkt_updates":       [
                 {"node": k, "mastery": v} for k, v in final.mastery_updates.items()
             ],
+            # LLM metacognitive outputs
+            "mastery_verdicts":  getattr(final, "mastery_verdicts", {}),
+            "session_narrative": getattr(final, "llm_decisions", {}).get("session_narrative", ""),
+            "focus_concept":     getattr(final, "llm_decisions", {}).get("focus_concept", ""),
             # Full results
             "results":           final.results,
         }
     except Exception as exc:
         logger.error(f"Assessment evaluation failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/exercise_complete", summary="Submit a single exercise result — updates BKT and KG edge weights")
+async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
+    """
+    Called each time a student submits an answer to a remediation exercise.
+
+    Runs two things immediately:
+    1. BKT mastery update for this student-standard pair (stored on SKILL_STATE edge)
+    2. EMA edge weight update for BUILDS_TOWARDS edges connected to this standard
+       (the knowledge graph learns which prerequisite relationships actually predict
+       whether students can master the target concept)
+
+    This makes the system learn from every exercise answer, not just from
+    formal assessments.
+    """
+    import uuid as _uuid
+    from datetime import datetime
+    from neo4j import GraphDatabase
+    from backend.app.core.settings import settings
+
+    P_SLIP  = 0.10
+    P_GUESS = 0.20
+    P_LEARN = 0.20
+    P_INIT  = 0.10
+    EMA_LR  = 0.05
+
+    def _bkt_update(p: float, correct: bool) -> float:
+        if correct:
+            denom = p * (1 - P_SLIP) + (1 - p) * P_GUESS
+            posterior = (p * (1 - P_SLIP)) / (denom + 1e-9)
+        else:
+            denom = p * P_SLIP + (1 - p) * (1 - P_GUESS)
+            posterior = (p * P_SLIP) / (denom + 1e-9)
+        return min(1.0, posterior + (1 - posterior) * P_LEARN)
+
+    session_id = body.session_id or str(_uuid.uuid4())
+    now_str    = datetime.utcnow().isoformat()
+
+    try:
+        driver = GraphDatabase.driver(
+            settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+        )
+
+        loop = asyncio.get_event_loop()
+
+        def _run_update():
+            with driver.session() as neo:
+                # ── 1. Read current BKT state ─────────────────────────────────
+                row = neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->(n:StandardsFrameworkItem {identifier: $nid})
+                    RETURN coalesce(r.p_mastery, $init) AS p_mastery,
+                           coalesce(r.attempts, 0)      AS attempts,
+                           coalesce(r.correct, 0)       AS correct
+                    """,
+                    sid=body.student_id, nid=body.node_identifier, init=P_INIT,
+                ).single()
+
+                p_before = float(row["p_mastery"]) if row else P_INIT
+                attempts  = int(row["attempts"]) + 1 if row else 1
+                correct_count = int(row["correct"]) + (1 if body.correct else 0) if row else (1 if body.correct else 0)
+
+                # ── 2. BKT update ────────────────────────────────────────────
+                p_after = _bkt_update(p_before, body.correct)
+
+                # ── 3. Write updated SKILL_STATE ─────────────────────────────
+                neo.run(
+                    """
+                    MERGE (s:Student {id: $sid})
+                    MERGE (n:StandardsFrameworkItem {identifier: $nid})
+                    MERGE (s)-[r:SKILL_STATE]->(n)
+                    SET r.p_mastery   = $pm,
+                        r.attempts    = $att,
+                        r.correct     = $cor,
+                        r.last_updated = $now
+                    """,
+                    sid=body.student_id, nid=body.node_identifier,
+                    pm=p_after, att=attempts, cor=correct_count, now=now_str,
+                )
+
+                # ── 4. Persist exercise attempt ──────────────────────────────
+                neo.run(
+                    """
+                    MERGE (q:GeneratedQuestion {id: $eid})
+                    SET   q.question_text   = $qtext,
+                          q.standard_code   = $code,
+                          q.dok_level       = $dok,
+                          q.question_type   = $qtype,
+                          q.difficulty_beta = $beta,
+                          q.created_at      = coalesce(q.created_at, $now)
+                    WITH q
+                    MATCH (n:StandardsFrameworkItem {identifier: $nid})
+                    MERGE (q)-[:TESTS]->(n)
+                    WITH q
+                    MERGE (s:Student {id: $sid})
+                    MERGE (s)-[a:ATTEMPTED {session_id: $sess, question_id: $eid}]->(q)
+                    SET   a.correct         = $correct,
+                          a.selected_answer = $selected,
+                          a.correct_answer  = $correct_ans,
+                          a.timestamp       = $now
+                    """,
+                    eid=body.exercise_id,
+                    qtext=body.question_text,
+                    code=body.standard_code,
+                    dok=body.dok_level,
+                    qtype=body.question_type,
+                    beta=body.difficulty_beta,
+                    now=now_str,
+                    nid=body.node_identifier,
+                    sid=body.student_id,
+                    sess=session_id,
+                    correct=body.correct,
+                    selected=body.selected_answer,
+                    correct_ans=body.correct_answer,
+                )
+
+                # ── 5. EMA edge weight update ────────────────────────────────
+                # For each BUILDS_TOWARDS edge pointing TO this standard:
+                # if prereq is highly mastered but student failed → increase weight
+                # if prereq mastered and student passed → weight confirmed
+                edge_result = neo.run(
+                    """
+                    MATCH (pre:StandardsFrameworkItem)-[r:BUILDS_TOWARDS]->(n:StandardsFrameworkItem {identifier: $nid})
+                    OPTIONAL MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->(pre)
+                    RETURN pre.identifier AS pre_id,
+                           coalesce(r.conceptual_weight, 0.7) AS weight,
+                           coalesce(sk.p_mastery, 0.1)        AS pre_mastery
+                    LIMIT 10
+                    """,
+                    nid=body.node_identifier, sid=body.student_id,
+                )
+                prereq_edges = [rec.data() for rec in edge_result]
+
+                updates = 0
+                for edge in prereq_edges:
+                    pre_mastery = float(edge["pre_mastery"])
+                    old_weight  = float(edge["weight"])
+                    pre_id      = edge["pre_id"]
+
+                    prereq_mastered = pre_mastery >= 0.65
+                    if prereq_mastered and body.correct:
+                        signal = 1.0   # edge was predictive: knowing prereq → can do target
+                    elif prereq_mastered and not body.correct:
+                        signal = 0.5   # knew prereq but still failed: edge is important (raise weight)
+                    elif not prereq_mastered and not body.correct:
+                        signal = 0.7   # both weak: neutral
+                    else:
+                        signal = 0.3   # didn't know prereq but got target right: edge less critical
+
+                    new_weight = round(
+                        max(0.3, min(1.0, old_weight * (1 - EMA_LR) + signal * EMA_LR)), 4
+                    )
+                    if abs(new_weight - old_weight) >= 0.001:
+                        neo.run(
+                            """
+                            MATCH (a:StandardsFrameworkItem {identifier: $pre_id})
+                                  -[r:BUILDS_TOWARDS]->(b:StandardsFrameworkItem {identifier: $nid})
+                            SET r.conceptual_weight    = $w,
+                                r.observation_count    = coalesce(r.observation_count, 0) + 1,
+                                r.last_weight_update   = $now
+                            """,
+                            pre_id=pre_id, nid=body.node_identifier,
+                            w=new_weight, now=now_str,
+                        )
+                        updates += 1
+
+                return {
+                    "p_mastery_before": round(p_before, 3),
+                    "p_mastery_after":  round(p_after, 3),
+                    "attempts":         attempts,
+                    "correct_total":    correct_count,
+                    "edge_updates":     updates,
+                }
+
+        result = await loop.run_in_executor(None, _run_update)
+        driver.close()
+
+        logger.info(
+            f"exercise_complete: student={body.student_id} "
+            f"std={body.standard_code} correct={body.correct} "
+            f"bkt {result['p_mastery_before']:.3f}→{result['p_mastery_after']:.3f} "
+            f"edge_updates={result['edge_updates']}"
+        )
+        return {
+            "student_id":       body.student_id,
+            "standard_code":    body.standard_code,
+            "correct":          body.correct,
+            **result,
+        }
+
+    except Exception as exc:
+        logger.error(f"exercise_complete failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get(
+    "/readiness/{student_id}",
+    summary="LLM-powered assessment readiness check",
+)
+async def assessment_readiness(
+    student_id: str,
+    subject: str = Query(..., description="math or english"),
+    grade: str   = Query(..., description="Grade level: 1-8"),
+    concepts: str = Query(
+        None,
+        description="Comma-separated standard codes to check (e.g. 3.NBT.A.1,3.NBT.B.2). "
+                    "If omitted, checks all tracked concepts for this student.",
+    ),
+) -> dict[str, Any]:
+    """
+    The LLM reviews this student's exercise history and BKT mastery trends
+    to decide whether they are ready for a formal re-assessment.
+
+    The verdict includes:
+    - ready: bool — should we offer an assessment now?
+    - trigger_now: bool — proactive suggestion (higher confidence)
+    - exercises_until_ready: int — if not ready, how many more exercises are needed
+    - concepts_to_assess: list — which standards to include in the next assessment
+    - session_focus: str — one-sentence guidance for the next practice session
+    - reasoning: str — the LLM's explanation
+
+    The AI Tutor calls this endpoint during conversation to decide whether
+    to proactively suggest re-assessment to the student.
+    """
+    from backend.app.agents.readiness_agent import check_assessment_readiness
+
+    concept_list = [c.strip() for c in concepts.split(",")] if concepts else None
+
+    try:
+        loop = asyncio.get_event_loop()
+        verdict = await loop.run_in_executor(
+            None,
+            lambda: check_assessment_readiness(student_id, subject, grade, concept_list),
+        )
+        return {
+            "student_id": student_id,
+            "subject":    subject,
+            "grade":      grade,
+            **verdict,
+        }
+    except Exception as exc:
+        logger.error(f"Readiness check failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

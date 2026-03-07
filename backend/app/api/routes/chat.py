@@ -138,6 +138,30 @@ def _build_system_prompt(
     if wrong_lines:
         sections += ["", "=== QUESTIONS ANSWERED INCORRECTLY ==="] + wrong_lines[:6]
 
+    # LLM metacognitive outputs (from judge_mastery + llm_recommendation_decider)
+    mastery_verdicts  = ctx.get("mastery_verdicts", {}) or {}
+    session_narrative = ctx.get("session_narrative", "") or ""
+    focus_concept     = ctx.get("focus_concept", "") or ""
+
+    if mastery_verdicts:
+        verdict_lines = []
+        for code, v in list(mastery_verdicts.items())[:8]:
+            verdict    = v.get("verdict", "unknown")
+            action     = v.get("next_action", "")
+            confidence = v.get("confidence", 0.5)
+            reasoning  = v.get("reasoning", "")
+            verdict_lines.append(
+                f"  • {code}: verdict={verdict} | action={action} "
+                f"| confidence={confidence:.0%}\n    {reasoning}"
+            )
+        sections += ["", "=== LLM MASTERY VERDICTS ==="] + verdict_lines
+
+    if session_narrative:
+        sections += ["", "=== SESSION NARRATIVE ===", f"  {session_narrative}"]
+
+    if focus_concept:
+        sections += ["", f"=== RECOMMENDED FOCUS CONCEPT: {focus_concept} ==="]
+
     sections += [
         "",
         "=== YOUR TUTORING GUIDELINES ===",
@@ -151,6 +175,9 @@ def _build_system_prompt(
         "- If asked a math or ELA question directly, work through it step-by-step.",
         "- Stay grounded in this student's actual results — no generic advice.",
         "- If the student seems discouraged, acknowledge their effort and reframe mistakes as learning.",
+        "- After a student completes practice exercises, proactively tell them if they seem ready for "
+        "  a formal re-assessment (hint: suggest it when their answers show consistent improvement).",
+        f"- The system's recommended focus concept is '{focus_concept}' — steer the conversation here when natural." if focus_concept else "",
     ]
 
     return "\n".join(sections)
