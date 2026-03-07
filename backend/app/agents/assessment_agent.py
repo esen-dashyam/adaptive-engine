@@ -144,7 +144,7 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
                   AND ANY(g IN b.gradeLevelList WHERE g IN [$pg, $tg])
                   AND a.academicSubject = $subject
                 RETURN a.identifier AS source, b.identifier AS target,
-                       coalesce(r.weight, 0.7) AS weight, type(r) AS rel_type
+                       coalesce(r.conceptual_weight, r.understanding_strength, 0.7) AS weight, type(r) AS rel_type
                 LIMIT 200
                 """,
                 pg=prereq_grade, tg=grade_num, subject=subject_name,

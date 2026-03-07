@@ -63,7 +63,7 @@ def generate_recommendations(state: AssessmentState) -> dict:
                     MATCH (a:StandardsFrameworkItem {identifier: nid})
                     OPTIONAL MATCH (a)-[r:PRECEDES|BUILDS_TOWARDS]->(b:StandardsFrameworkItem)
                     RETURN a.identifier AS source, b.identifier AS target,
-                           coalesce(r.weight, 0.7) AS weight, type(r) AS rel_type
+                           coalesce(r.conceptual_weight, r.understanding_strength, 0.7) AS weight, type(r) AS rel_type
                     """,
                     ids=all_node_ids[:50],
                 )

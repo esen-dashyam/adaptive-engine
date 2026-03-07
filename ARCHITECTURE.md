@@ -430,42 +430,306 @@ All agents call `get_llm()` which returns the module-level singleton `VertexLLM`
 
 ---
 
-## Neo4j Schema
+## Neo4j Graph Database — Full Schema
 
-### Node Labels
-- `StandardsFrameworkItem` — one per standard (CCSS, TEKS, CA, FL, NY, GA, NC, OH, Multi-State)
-- `Student` — one per student ID
-- `GeneratedQuestion` — persisted generated questions (optional)
+### Live Node Counts (as of last import)
 
-### Key Node Properties (`StandardsFrameworkItem`)
-| Property | Example |
+| Node Label | Count | Purpose |
+|---|---|---|
+| `StandardsFrameworkItem` | 144,733 | Every curriculum standard (CCSS, TEKS, CA, FL, NY, GA, NC, OH, Multi-State) |
+| `LearningComponent` | 3,805 | Cluster/domain nodes that group standards |
+| `GeneratedQuestion` | 30 | Questions generated and persisted by the system |
+| `Student` | 1+ | One node per student ID |
+| `RaschSession` | 4 | Persistent IRT session snapshots per student |
+| `Concept` | 0 | Reserved for future concept graph expansion |
+| `Chunk` | 0 | Reserved for RAG document chunking |
+
+---
+
+### `StandardsFrameworkItem` Node Properties
+
+| Property | Type | Example |
+|---|---|---|
+| `identifier` | string | `"ccss-math-1-nbt-b-3"` |
+| `statementCode` | string | `"1.NBT.B.3"` |
+| `description` | string | `"Compare two two-digit numbers…"` |
+| `gradeLevelList` | list\<string\> | `["1"]` |
+| `gradeLevel` | string | `"1"` (singular, legacy field) |
+| `academicSubject` | string | `"Mathematics"` or `"English Language Arts"` |
+| `jurisdiction` | string | `"Multi-State"`, `"Texas"`, `"California"` … |
+| `normalizedStatementType` | string | `"Standard"`, `"Cluster"`, `"Domain"` |
+| `statementType` | string | Raw type from source data |
+| `provider` | string | Source organisation |
+| `author` | string | Authoring body |
+| `dateModified` | string | ISO date |
+| `inLanguage` | string | `"en"` |
+| `license` | string | License URL |
+
+---
+
+### `Student` Node Properties
+
+| Property | Purpose |
 |---|---|
-| `identifier` | `"ccss-math-1-nbt-b-3"` |
-| `statementCode` | `"1.NBT.B.3"` |
-| `description` | `"Compare two two-digit numbers…"` |
-| `gradeLevelList` | `["1"]` |
-| `academicSubject` | `"Mathematics"` |
-| `jurisdiction` | `"Multi-State"` or `"Texas"` |
-| `normalizedStatementType` | `"Standard"` |
+| `id` | Application-level student identifier e.g. `"student_001"` |
 
-### Relationship Types
-| Relationship | Meaning |
-|---|---|
-| `BUILDS_TOWARDS` | Concept A is prerequisite for concept B |
-| `HAS_DEPENDENCY` | Alternate prerequisite edge type |
-| `DEFINES_UNDERSTANDING` | Alternate prerequisite edge type |
-| `PRECEDES` | Sequential ordering (A before B) |
-| `HAS_CHILD` | Hierarchical cluster → standard |
-| `TESTS` | GeneratedQuestion → StandardsFrameworkItem |
-| `SKILL_STATE` | Student → StandardsFrameworkItem (mastery edge) |
+---
 
-### `SKILL_STATE` Edge Properties
-| Property | Meaning |
+### `RaschSession` Node Properties
+
+| Property | Purpose |
 |---|---|
-| `p_mastery` | BKT P(mastered) float 0–1 |
-| `attempts` | Total attempts count |
-| `correct` | Total correct count |
-| `last_updated` | datetime() |
+| `session_id` | UUID of the session |
+| `student_id` | Links to Student.id |
+| `theta` | Final Rasch ability logit after session |
+| `q_count` | Number of questions answered |
+| `grade` | Grade level of the session |
+| `status` | `"completed"` etc. |
+| `created_at` | Timestamp |
+
+---
+
+### `GeneratedQuestion` Node Properties
+
+Stored when a question is persisted after generation. Linked via `TESTS_STANDARD` to the `StandardsFrameworkItem` it tests.
+
+---
+
+### Relationship Types — Full Inventory
+
+#### Curriculum prerequisite edges (connect `StandardsFrameworkItem` nodes)
+
+| Relationship | Count | Key Properties | Meaning |
+|---|---|---|---|
+| `BUILDS_TOWARDS` | 5,301 | `conceptual_weight`, `description`, `identifier` | A is a prerequisite concept for B. **Primary edge used by IRT selector and KST.** |
+| `DEFINES_UNDERSTANDING` | 102,368 | `conceptual_weight`, `understanding_strength`, `inferred`, `source`, `created_at` | A must be understood to understand B. Inferred by the enrichment script. **Largest edge set — used by misconception KST propagation.** |
+| `buildsTowards` | 418 | same as BUILDS_TOWARDS | camelCase duplicate from original LC import (same semantics) |
+| `hasDependency` | 158 | `identifier`, `provider` | Hard dependency from source data |
+| `HAS_CHILD` | 25,740 | — | UPPER_SNAKE_CASE re-import of `hasChild` |
+| `hasChild` | 134,528 | `identifier`, `provider` | Hierarchical: cluster/domain → standard |
+| `hasStandardAlignment` / `HAS_STANDARD_ALIGNMENT` | 8,951 / 8,949 | — | Cross-framework standard alignment |
+| `hasEducationalAlignment` | 26,870 | — | Educational alignment edges |
+| `hasPart` | 10,095 | — | Part-of relationship |
+| `relatesTo` / `RELATES_TO` | 160 / 160 | — | Generic topical relation |
+| `mutuallyExclusiveWith` | 96 | — | Standards that cannot co-occur |
+| `hasReference` | 72 | — | Citation/reference links |
+
+> **Note on duplicates:** The graph has both camelCase (`hasChild`, `buildsTowards`) and UPPER_SNAKE_CASE (`HAS_CHILD`, `BUILDS_TOWARDS`) versions of several relationship types. The camelCase ones came from the original Learning Commons import; UPPER_SNAKE_CASE were added by the enrichment scripts. The agents query `BUILDS_TOWARDS` (uppercase).
+
+#### Edge weights — what the agents actually use
+
+The agents call `coalesce(r.conceptual_weight, 0.7)` on `BUILDS_TOWARDS` and `DEFINES_UNDERSTANDING` edges. The actual property name is **`conceptual_weight`** (not `weight`).
+
+| Property | Type | Range | Meaning |
+|---|---|---|---|
+| `conceptual_weight` | float | 0.0 – 1.0 | Strength of prerequisite dependency. ≥ 0.9 = **hard block** (failing A locks B) |
+| `understanding_strength` | float | 0.0 – 1.0 | On `DEFINES_UNDERSTANDING` — how strongly A explains B |
+| `inferred` | bool | — | `true` if created by enrichment script, `false` if from source data |
+
+#### Student mastery edges
+
+| Relationship | Connects | Properties |
+|---|---|---|
+| `SKILL_STATE` | `Student` → `StandardsFrameworkItem` | `p_mastery` (float 0–1), `attempts` (int), `correct` (int), `last_updated` (datetime) |
+
+This is the **primary source of truth for student mastery**. Written by `update_bkt` after every Phase B evaluation.
+
+#### Question edges
+
+| Relationship | Connects | Meaning |
+|---|---|---|
+| `TESTS_STANDARD` | `GeneratedQuestion` → `StandardsFrameworkItem` | Links a generated question to the standard it tests |
+
+---
+
+### Agentic Workflows on the Graph
+
+#### Phase A — Question Selection reads from Neo4j
+
+```
+1. select_standards_irt
+   MATCH (n:StandardsFrameworkItem)
+   WHERE jurisdiction = $state AND academicSubject = $subject
+     AND ANY(g IN n.gradeLevelList WHERE g = $grade)
+     AND n.normalizedStatementType = 'Standard'
+   → Returns candidate nodes for IRT ranking
+
+2. select_standards_irt (edges)
+   MATCH (a)-[r:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(b)
+   RETURN coalesce(r.conceptual_weight, 0.7) AS weight
+   → Builds prerequisite map for IRT constraint (skip node if prereq failed)
+
+3. fetch_rag_context
+   MATCH (pre)-[:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(n)
+   → Prereqs injected into Gemini prompt for curriculum alignment
+
+   MATCH (q:GeneratedQuestion)-[:TESTS_STANDARD]->(n)
+   → Existing question stems to avoid repetition
+```
+
+#### Phase B — Evaluation writes to + reads from Neo4j
+
+```
+4. update_bkt
+   MERGE (s:Student {id}) -[r:SKILL_STATE]-> (n:StandardsFrameworkItem {identifier})
+   SET r.p_mastery, r.attempts, r.correct, r.last_updated
+   → Writes BKT mastery after every answer
+
+5. identify_and_rank_gaps
+   MATCH (a)-[r:PRECEDES|BUILDS_TOWARDS|HAS_CHILD]->(b)  — fetches 2-hop subgraph
+   MATCH (n)-[:PRECEDES|BUILDS_TOWARDS*1..3]->(downstream) — downstream impact count
+   → KST propagation uses this subgraph to infer mastery of untested nodes
+
+6. generate_recommendations
+   MATCH (a)-[r:PRECEDES|BUILDS_TOWARDS]->(b)
+   → Builds frontier graph for ZPD identification
+   MATCH (n:StandardsFrameworkItem {identifier})
+     RETURN n.statementCode, n.description, n.gradeLevelList, n.academicSubject
+   → Fetches node details for recommendation enrichment
+
+7. chat/context endpoint (AI Tutor)
+   MATCH (s:Student {id})-[r:SKILL_STATE]->(n:StandardsFrameworkItem)
+   ORDER BY r.last_updated DESC
+   → Live mastery profile for standalone AI Tutor grounding
+```
+
+---
+
+## PostgreSQL — Full Schema
+
+PostgreSQL is the **secondary/analytics store**. Neo4j `SKILL_STATE` edges are the primary source of truth for mastery. Postgres holds the full audit trail of sessions and answers, enabling historical analytics and reporting queries that would be expensive in the graph.
+
+**Connection:** `postgresql://ale_user:ale_pass@localhost:5433/ale_db`
+
+All tables currently have 0 rows — the repositories are defined and ready but the `/generate` and `/evaluate` API routes do not yet call them. The Postgres write path is the next integration milestone.
+
+---
+
+### Table: `students`
+
+One row per unique student ID seen by the system.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (PK) | Internal UUID, auto-generated |
+| `external_id` | VARCHAR(255) UNIQUE | App-level ID e.g. `"student_001"` — matches Neo4j `Student.id` |
+| `display_name` | VARCHAR(255) | Optional human-readable name |
+| `grade_level` | VARCHAR(10) | Last known grade e.g. `"K3"` |
+| `overall_ability` | FLOAT | Cached Rasch θ (default 0.3) |
+| `created_at` | TIMESTAMPTZ | Auto on insert |
+| `updated_at` | TIMESTAMPTZ | Auto on update |
+
+**Relationships:** one Student → many `assessment_sessions`, many `mastery_records`
+
+---
+
+### Table: `mastery_records`
+
+One row per student × standard. The Postgres audit copy of what Neo4j `SKILL_STATE` holds.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (PK) | |
+| `student_id` | UUID (FK → students) | CASCADE delete |
+| `standard_code` | VARCHAR(512) | `statementCode` e.g. `"3.NF.A.1"` |
+| `subject` | VARCHAR(100) | `"Mathematics"` / `"English Language Arts"` |
+| `grade` | VARCHAR(10) | Grade level |
+| `mastery_prob` | FLOAT | BKT P(mastered) ∈ [0, 1] |
+| `attempts` | INT | Total attempts across all sessions |
+| `correct` | INT | Total correct answers |
+| `last_assessed` | TIMESTAMPTZ | When this standard was last tested |
+| `updated_at` | TIMESTAMPTZ | Auto on update |
+
+**Repository methods:** `upsert()`, `list_for_student()`, `get_gaps(threshold=0.7)`
+
+---
+
+### Table: `assessment_sessions`
+
+One row per completed assessment run.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (PK) | The `assessment_id` returned by `/generate` |
+| `student_id` | UUID (FK → students) | CASCADE delete |
+| `grade` | VARCHAR(10) | e.g. `"K3"` |
+| `subject` | VARCHAR(100) | e.g. `"math"` |
+| `framework` | VARCHAR(100) | e.g. `"CCSS"`, `"TEKS"` |
+| `state_jurisdiction` | VARCHAR(50) | e.g. `"Texas"`, `"Multi-State"` |
+| `num_questions` | INT | How many questions were generated |
+| `score` | FLOAT | Fraction correct 0–1 |
+| `phase` | VARCHAR(30) | `in_progress` → `evaluated` → `remediation` → `done` |
+| `gap_analysis` | JSONB | Full gap list from `identify_and_rank_gaps` |
+| `remediation_plan` | JSONB | Full remediation plan from `generate_remediation` |
+| `started_at` | TIMESTAMPTZ | When `/generate` was called |
+| `completed_at` | TIMESTAMPTZ | When `/evaluate` finished |
+
+**Repository methods:** `create_session()`, `get_session()`, `save_answer()`, `finalize_session()`, `list_sessions_for_student()`
+
+---
+
+### Table: `assessment_answers`
+
+One row per question answered within a session.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (PK) | |
+| `session_id` | UUID (FK → assessment_sessions) | CASCADE delete |
+| `question_id` | VARCHAR(64) | UUID from the generated question |
+| `question_text` | TEXT | Full question text |
+| `standard_code` | VARCHAR(512) | `statementCode` of tested standard |
+| `category` | VARCHAR(20) | `"prerequisite"` or `"target"` |
+| `dok_level` | INT | Depth of Knowledge 1–4 |
+| `student_answer` | VARCHAR(10) | `"A"`, `"B"`, `"C"`, or `"D"` |
+| `correct_answer` | VARCHAR(10) | The correct option letter |
+| `is_correct` | BOOL | Scored result |
+| `mastery_before` | FLOAT | BKT P(mastery) before this answer |
+| `mastery_after` | FLOAT | BKT P(mastery) after this answer |
+| `answered_at` | TIMESTAMPTZ | Auto on insert |
+
+---
+
+### PostgreSQL Entity Relationship Diagram
+
+```
+students (1)
+  ├──< assessment_sessions (many)
+  │       └──< assessment_answers (many)
+  └──< mastery_records (many)
+```
+
+---
+
+### Dual-Database Design Pattern
+
+```
+                    ┌─────────────────────────────┐
+                    │         Neo4j (primary)      │
+                    │                              │
+  Phase A ─────────►│  StandardsFrameworkItem       │
+  (read)            │  BUILDS_TOWARDS / DEFINES_   │
+                    │  UNDERSTANDING edges          │
+                    │  GeneratedQuestion nodes      │
+                    │                              │
+  Phase B ─────────►│  SKILL_STATE edges            │◄── source of truth
+  (read+write)      │  (p_mastery, attempts,        │    for live mastery
+                    │   correct, last_updated)      │
+                    └─────────────────────────────┘
+                              │ mirror
+                              ▼
+                    ┌─────────────────────────────┐
+                    │      PostgreSQL (secondary)  │
+                    │                              │
+                    │  students                    │
+                    │  mastery_records  ◄── audit  │
+                    │  assessment_sessions          │
+                    │  assessment_answers           │
+                    └─────────────────────────────┘
+                          used for: analytics,
+                          history, reporting,
+                          audit trail, JSONB queries
+```
 
 ---
 

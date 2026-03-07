@@ -58,11 +58,11 @@ def fetch_kg_edges(state: AssessmentState) -> dict:
                 OPTIONAL MATCH (c:StandardsFrameworkItem)-[r2:PRECEDES|BUILDS_TOWARDS]->(a)
                 WITH collect(DISTINCT {
                     source: a.identifier, target: b.identifier,
-                    weight: coalesce(r.weight, 0.7), rel_type: type(r)
+                    weight: coalesce(r.conceptual_weight, r.understanding_strength, 0.7), rel_type: type(r)
                 }) +
                 collect(DISTINCT {
                     source: c.identifier, target: a.identifier,
-                    weight: coalesce(r2.weight, 0.7), rel_type: type(r2)
+                    weight: coalesce(r2.conceptual_weight, r2.understanding_strength, 0.7), rel_type: type(r2)
                 }) AS all_edges
                 UNWIND all_edges AS edge
                 WITH edge
@@ -137,10 +137,10 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
                 OPTIONAL MATCH (c:StandardsFrameworkItem)-[r2:PRECEDES|BUILDS_TOWARDS]->(a)
                 WITH collect(DISTINCT {
                     source: a.identifier, target: b.identifier,
-                    weight: coalesce(r.weight, 0.7), rel_type: type(r)
+                    weight: coalesce(r.conceptual_weight, r.understanding_strength, 0.7), rel_type: type(r)
                 }) + collect(DISTINCT {
                     source: c.identifier, target: a.identifier,
-                    weight: coalesce(r2.weight, 0.7), rel_type: type(r2)
+                    weight: coalesce(r2.conceptual_weight, r2.understanding_strength, 0.7), rel_type: type(r2)
                 }) AS all_edges
                 UNWIND all_edges AS edge
                 WITH edge
