@@ -84,6 +84,16 @@ class AssessmentState(BaseModel):
     # node_identifier → temporary mastery weight penalty from misconception inference
     misconception_weights: dict[str, float] = Field(default_factory=dict)
 
+    # ── Exercise Memory ───────────────────────────────────────────────────────
+    # standard_code → list of prior exercise records {question_text, correct, dok_level, timestamp}
+    exercise_memory: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+
+    # ── Metacognitive Agent (LLM mastery judgments) ───────────────────────────
+    # standard_code → {verdict, confidence, reasoning, next_action, override_mastery}
+    mastery_verdicts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # LLM recommendation decisions {final_recommendations, session_narrative, focus_concept, ...}
+    llm_decisions: dict[str, Any] = Field(default_factory=dict)
+
     # ── Postgres session tracking ─────────────────────────────────────────────
     pg_session_id: str | None = None   # UUID string of AssessmentSession row
     pg_student_uuid: str | None = None # UUID string of Student row

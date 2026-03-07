@@ -115,7 +115,7 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
     Returns updated knowledge_state, hard_blocked_nodes, and gaps list.
     """
     logger.info("━" * 60)
-    logger.info(f"  PHASE B — STEP 5/7 │ identify_and_rank_gaps  (KST propagation)")
+    logger.info(f"  PHASE B — STEP 7/12 │ identify_and_rank_gaps  (KST propagation)")
     logger.info("━" * 60)
     # Step A: fetch KG edges
     tested_ids = list({r.get("node_ref", "") for r in state.results if r.get("node_ref")})

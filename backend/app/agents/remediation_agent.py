@@ -47,7 +47,7 @@ def generate_remediation(state: AssessmentState) -> dict:
     Uses Vertex AI to create exercises informed by misconceptions + θ.
     """
     logger.info("━" * 60)
-    logger.info(f"  PHASE B — STEP 6/7 │ generate_remediation  ({len(state.gaps[:MAX_GAPS_TO_REMEDIATE])} gaps → Gemini)")
+    logger.info(f"  PHASE B — STEP 8/12 │ generate_remediation  ({len(state.gaps[:MAX_GAPS_TO_REMEDIATE])} gaps → Gemini)")
     logger.info("━" * 60)
     gaps = state.gaps[:MAX_GAPS_TO_REMEDIATE]
     if not gaps:
@@ -90,12 +90,33 @@ def generate_remediation(state: AssessmentState) -> dict:
             if misconception else ""
         )
 
+        # Build exercise memory context for this standard
+        prior_exercises = state.exercise_memory.get(code, [])
+        memory_block = ""
+        if prior_exercises:
+            seen_questions = [
+                f"  - {'✓' if e['correct'] else '✗'} DOK{e.get('dok_level',2)}: {e['question_text'][:100]}"
+                for e in prior_exercises[:6]
+            ]
+            correct_count = sum(1 for e in prior_exercises if e.get("correct"))
+            memory_block = (
+                f"\nStudent exercise history for this standard ({correct_count}/{len(prior_exercises)} correct):\n"
+                + "\n".join(seen_questions)
+                + "\nIMPORTANT: Do NOT repeat or closely paraphrase the above questions. "
+                + "Generate exercises that approach the concept from a DIFFERENT angle."
+                + (
+                    "\nThe student has struggled with this concept across multiple sessions — "
+                    "try a more concrete, visual, or real-world framing."
+                    if correct_count / len(prior_exercises) < 0.4 else ""
+                )
+            )
+
         prompt = f"""You are a remediation specialist creating targeted practice exercises for a {grade_label} {subject_name} student.
 
 Student ability θ = {theta:+.2f} (0 = average; negative = struggling; positive = strong)
 Gap: {code} — {description}
 Current mastery probability: {mastery:.0%}
-Exercise focus: {exercise_type} (DOK {dok_target}){misconception_line}
+Exercise focus: {exercise_type} (DOK {dok_target}){misconception_line}{memory_block}
 
 Create exactly 3 practice exercises that:
 1. Are age-appropriate for {grade_label}
@@ -103,6 +124,7 @@ Create exactly 3 practice exercises that:
 3. Progress from easier to harder within the 3 exercises
 4. Include a brief explanation of the underlying concept for each exercise
 5. Are concrete and use real-world {subject_name} scenarios
+6. Are DIFFERENT from any exercises the student has already seen (listed above)
 
 Return ONLY a valid JSON object:
 {{

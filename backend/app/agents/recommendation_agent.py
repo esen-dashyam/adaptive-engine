@@ -43,7 +43,7 @@ def generate_recommendations(state: AssessmentState) -> dict:
     Each recommendation is enriched with Vertex AI rationale.
     """
     logger.info("━" * 60)
-    logger.info(f"  PHASE B — STEP 7/7 │ generate_recommendations  (ZPD frontier, θ={state.theta:+.3f})")
+    logger.info(f"  PHASE B — STEP 10/12 │ generate_recommendations  (ZPD frontier, θ={state.theta:+.3f})")
     logger.info("━" * 60)
     if not state.knowledge_state:
         return {"recommendations": []}
