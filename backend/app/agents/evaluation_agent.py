@@ -25,22 +25,51 @@ from backend.app.agents.vertex_llm import get_llm
 from backend.app.core.settings import settings
 
 
-# ── BKT constants ─────────────────────────────────────────────────────────────
-P_INIT   = 0.1
-P_LEARN  = 0.2
-P_SLIP   = 0.1
-P_GUESS  = 0.2
+# Default BKT params — used when a node has no fitted values yet.
+# After BKTFitter runs, per-skill values on the node override these.
+from backend.app.student.bkt_fitter import (
+    DEFAULT_P_INIT,
+    DEFAULT_P_TRANSIT,
+    DEFAULT_P_SLIP,
+    DEFAULT_P_GUESS,
+)
 
 
-def _bkt_update(p_mastery: float, correct: bool) -> float:
-    p_slip, p_guess = P_SLIP, P_GUESS
+def _bkt_update(
+    p_mastery: float,
+    correct: bool,
+    p_slip: float,
+    p_guess: float,
+    p_transit: float,
+    phi: float = 1.0,
+) -> float:
+    """
+    Neuro-Symbolic BKT update: traditional Bayes posterior + φ-modulated transition.
+
+    Standard step (Bayes posterior):
+        P(L | correct) = P(L)(1-slip) / [P(L)(1-slip) + (1-P(L))guess]
+        P(L | wrong)   = P(L)slip     / [P(L)slip     + (1-P(L))(1-guess)]
+
+    φ-modulated transition (the "Signal Bridge"):
+        P(L_{t+1}) = P(L|obs) + (1 - P(L|obs)) * (p_transit * φ)
+
+    φ = 1.0  → full learning gain (fluent, genuine understanding)
+    φ = 0.5  → half gain (brittle mastery, possible guess)
+    φ = 0.0  → no transition (mastery frozen at posterior)
+    φ = -1.0 → un-learning: engine stays or moves backward (deep block)
+
+    This lets LLM-detected confusion actively pull P(L) down, forcing the
+    system to remediate rather than silently over-credit a correct answer.
+    """
     if correct:
-        denom = p_mastery * (1 - p_slip) + (1 - p_mastery) * p_guess
-        posterior = (p_mastery * (1 - p_slip)) / (denom + 1e-9)
+        denom = p_mastery * (1.0 - p_slip) + (1.0 - p_mastery) * p_guess
+        posterior = (p_mastery * (1.0 - p_slip)) / (denom + 1e-9)
     else:
-        denom = p_mastery * p_slip + (1 - p_mastery) * (1 - p_guess)
+        denom = p_mastery * p_slip + (1.0 - p_mastery) * (1.0 - p_guess)
         posterior = (p_mastery * p_slip) / (denom + 1e-9)
-    return min(1.0, posterior + (1 - posterior) * P_LEARN)
+    # φ-modulated transition (φ can be negative → un-learning)
+    updated = posterior + (1.0 - posterior) * (p_transit * phi)
+    return max(0.01, min(0.999, updated))
 
 
 def _neo4j():
@@ -50,15 +79,39 @@ def _neo4j():
     )
 
 
-def _get_student_mastery(session, student_id: str, node_id: str) -> float:
+def _get_student_mastery_and_params(
+    session, student_id: str, node_id: str
+) -> tuple[float, float, float, float]:
+    """
+    Returns (p_mastery, p_slip, p_guess, p_transit) for this student-skill pair.
+
+    p_mastery comes from the SKILL_STATE edge (defaults to p_init if new).
+    p_slip/p_guess/p_transit come from the node's fitted BKT params if present,
+    otherwise fall back to system defaults.
+    """
     r = session.run(
         """
-        MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->(n:StandardsFrameworkItem {identifier: $nid})
-        RETURN r.p_mastery AS p
+        MATCH (n:StandardsFrameworkItem {identifier: $nid})
+        OPTIONAL MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->(n)
+        RETURN coalesce(sk.p_mastery, $def_init)      AS p_mastery,
+               coalesce(n.bkt_p_slip,    $def_slip)    AS p_slip,
+               coalesce(n.bkt_p_guess,   $def_guess)   AS p_guess,
+               coalesce(n.bkt_p_transit, $def_transit) AS p_transit
         """,
         sid=student_id, nid=node_id,
+        def_init=DEFAULT_P_INIT,
+        def_slip=DEFAULT_P_SLIP,
+        def_guess=DEFAULT_P_GUESS,
+        def_transit=DEFAULT_P_TRANSIT,
     ).single()
-    return float(r["p"]) if r and r["p"] is not None else P_INIT
+    if not r:
+        return DEFAULT_P_INIT, DEFAULT_P_SLIP, DEFAULT_P_GUESS, DEFAULT_P_TRANSIT
+    return (
+        float(r["p_mastery"]),
+        float(r["p_slip"]),
+        float(r["p_guess"]),
+        float(r["p_transit"]),
+    )
 
 
 def _upsert_mastery(session, student_id: str, node_id: str, p_mastery: float,
@@ -91,6 +144,8 @@ def score_answers(state: AssessmentState) -> dict:
     results = []
     correct_count = 0
 
+    time_per_question: dict[str, float] = {}
+
     for submission in state.submitted_answers:
         qid = submission.get("question_id", "")
         selected = submission.get("selected_answer", "").upper().strip()
@@ -101,6 +156,18 @@ def score_answers(state: AssessmentState) -> dict:
         if is_correct:
             correct_count += 1
 
+        # Capture time-to-respond for Fidelity Multiplier (ms → stored per question)
+        time_ms = float(submission.get("time_ms", 0.0))
+        if qid:
+            time_per_question[qid] = time_ms
+
+        # Fluency flag: very fast correct answers (< 4 s) may indicate a guess
+        # This is used later by apply_fidelity_correction to halve the BKT gain.
+        is_likely_guess = is_correct and 0 < time_ms < 4000
+
+        # Chat message typed by the student alongside this answer (may be empty)
+        chat_message = submission.get("chat_message", "") or ""
+
         results.append({
             "question_id": qid,
             "question":    q.get("question", ""),
@@ -108,6 +175,9 @@ def score_answers(state: AssessmentState) -> dict:
             "correct_answer": correct_ans,
             "student_answer": selected,
             "is_correct":   is_correct,
+            "is_likely_guess": is_likely_guess,
+            "time_ms":      time_ms,
+            "chat_message": chat_message,
             "category":     q.get("category", "target"),
             "dok_level":    q.get("dok_level", 2),
             "standard_code": q.get("standard_code", ""),
@@ -119,7 +189,7 @@ def score_answers(state: AssessmentState) -> dict:
 
     score = correct_count / max(len(results), 1)
     logger.info(f"Evaluation Agent: score={score:.2%}  ({correct_count}/{len(results)})")
-    return {"results": results, "score": score}
+    return {"results": results, "score": score, "time_per_question": time_per_question}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,10 +221,13 @@ def update_rasch(state: AssessmentState) -> dict:
         f"(SE={rasch.se:.3f}, equiv={rasch_summary['grade_equivalent']})"
     )
 
+    total_answered = state.total_answered + len(updated_results)
     return {
-        "results": updated_results,
-        "theta": rasch.theta,
-        "theta_history": [h["theta_after"] for h in rasch.history],
+        "results":        updated_results,
+        "theta":          rasch.theta,
+        "theta_history":  [h["theta_after"] for h in rasch.history],
+        "se":             rasch.se,
+        "total_answered": total_answered,
     }
 
 
@@ -183,7 +256,7 @@ def detect_misconceptions(state: AssessmentState) -> dict:
     for r in wrong_answers[:6]:  # cap at 6 to keep prompt short
         cases.append(
             f"- Standard: {r.get('standard_code','')} | "
-            f"Question: {r.get('question','')[:120]} | "
+            f"Question: {(r.get('question') or '')[:120]} | "
             f"Student answered: {r.get('student_answer','')} | "
             f"Correct: {r.get('correct_answer','')}"
         )
@@ -193,21 +266,26 @@ def detect_misconceptions(state: AssessmentState) -> dict:
 A student got the following questions wrong:
 {chr(10).join(cases)}
 
-For EACH wrong answer:
-1. Identify the most likely underlying misconception (1 short sentence).
-2. List 1-3 concept node IDs (from the standard codes) that are likely affected by this misconception.
-3. Assign a mastery penalty (0.1 to 0.4) — how much to lower mastery of the affected nodes.
+For EACH wrong answer, diagnose which specific PREREQUISITE skill broke down.
+Think like a teacher reading the student's work: the surface error (e.g. wrong fraction)
+usually points to a gap in a foundational skill (e.g. multiplication facts, place value).
 
-Return a JSON array:
+Return a JSON array — one entry per wrong answer:
 [
   {{
     "question_id": "<id from the question>",
-    "standard_code": "<code>",
-    "misconception": "<short description>",
+    "standard_code": "<the standard being tested, e.g. 4.NF.A.1>",
+    "misconception": "<one sentence: what the student misunderstood>",
+    "root_prerequisite_code": "<the SINGLE prerequisite standard code most responsible for the failure, e.g. 3.OA.A.1>",
     "affected_standards": ["<code1>", "<code2>"],
     "mastery_penalty": 0.2
   }}
-]"""
+]
+
+Rules:
+- root_prerequisite_code must be a PREREQUISITE of the tested standard, not the standard itself
+- If no prerequisite is clearly responsible, set root_prerequisite_code to null
+- mastery_penalty: 0.1 (minor gap) to 0.4 (fundamental breakdown)"""
 
     llm = get_llm()
     misconceptions = []
@@ -222,17 +300,106 @@ Return a JSON array:
                 misconceptions.append(item)
                 penalty = float(item.get("mastery_penalty", 0.15))
                 for std_code in item.get("affected_standards", []):
-                    # accumulate penalties (max 0.5 total per node)
                     existing = misconception_weights.get(std_code, 0.0)
                     misconception_weights[std_code] = min(0.5, existing + penalty)
     except Exception as exc:
         logger.warning(f"Misconception detection failed (non-fatal): {exc}")
 
+    # Back-propagate failure to root prerequisite nodes in Neo4j
+    # This is the key step Gemini described: if the LLM says "Basic Division (3.OA.A.1)
+    # is the root cause of this Fractions failure", we write a BKT incorrect observation
+    # directly to the Division node — not just a temporary penalty on the Fractions node.
+    if misconceptions:
+        _backpropagate_to_prerequisites(state.student_id, misconceptions)
+
     logger.info(
         f"Misconception detection: {len(misconceptions)} misconceptions found, "
-        f"{len(misconception_weights)} nodes penalised"
+        f"{len(misconception_weights)} nodes penalised, "
+        f"{sum(1 for m in misconceptions if m.get('root_prerequisite_code'))} prereqs back-propagated"
     )
     return {"misconceptions": misconceptions, "misconception_weights": misconception_weights}
+
+
+def _backpropagate_to_prerequisites(
+    student_id: str,
+    misconceptions: list[dict],
+) -> None:
+    """
+    For each misconception where the LLM identified a root prerequisite,
+    write a BKT incorrect observation to that prerequisite's SKILL_STATE in Neo4j.
+
+    This is distinct from the misconception_weights penalty (which is a temporary
+    surface adjustment): this is a permanent BKT signal on the actual prerequisite node,
+    meaning future assessments will surface that gap.
+    """
+    # Collect unique root prerequisite codes with their penalties
+    prereq_penalties: dict[str, float] = {}
+    for item in misconceptions:
+        code = item.get("root_prerequisite_code")
+        if not code:
+            continue
+        penalty = float(item.get("mastery_penalty", 0.15))
+        # Take the largest penalty if a prereq appears multiple times
+        prereq_penalties[code] = max(prereq_penalties.get(code, 0.0), penalty)
+
+    if not prereq_penalties:
+        return
+
+    driver = _neo4j()
+    try:
+        with driver.session() as session:
+            for std_code, penalty in prereq_penalties.items():
+                # Look up the node identifier for this standard code
+                node_row = session.run(
+                    """
+                    MATCH (n:StandardsFrameworkItem {statementCode: $code})
+                    WHERE n.normalizedStatementType = 'Standard'
+                    RETURN n.identifier AS nid
+                    LIMIT 1
+                    """,
+                    code=std_code,
+                ).single()
+
+                if not node_row or not node_row["nid"]:
+                    logger.debug(f"Back-propagation: no node found for code {std_code}")
+                    continue
+
+                nid = node_row["nid"]
+
+                # Read current mastery + per-skill BKT params for this prereq node
+                p_before, p_slip, p_guess, p_transit = _get_student_mastery_and_params(
+                    session, student_id, nid
+                )
+
+                # Apply the penalty first (LLM's confidence signal),
+                # then run a BKT incorrect update (marks an observed failure)
+                p_penalised = max(0.05, p_before - penalty)
+                p_after = _bkt_update(p_penalised, correct=False,
+                                      p_slip=p_slip, p_guess=p_guess, p_transit=p_transit)
+
+                # Read current attempt counts
+                count_row = session.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->
+                          (n:StandardsFrameworkItem {identifier: $nid})
+                    RETURN coalesce(r.attempts, 0) AS att,
+                           coalesce(r.correct, 0)  AS cor
+                    """,
+                    sid=student_id, nid=nid,
+                ).single()
+                attempts = (count_row["att"] if count_row else 0) + 1
+                correct  = (count_row["cor"] if count_row else 0)  # incorrect observation
+
+                _upsert_mastery(session, student_id, nid, p_after, attempts, correct)
+
+                logger.info(
+                    f"Back-propagated to {std_code} ({nid}): "
+                    f"p_mastery {p_before:.3f} → {p_after:.3f} (penalty={penalty})"
+                )
+    except Exception as exc:
+        logger.warning(f"Prerequisite back-propagation failed (non-fatal): {exc}")
+    finally:
+        driver.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,16 +425,27 @@ def update_bkt(state: AssessmentState) -> dict:
                 if not nid:
                     continue
 
-                # Read current BKT mastery
-                p_before = _get_student_mastery(neo_sess, state.student_id, nid)
+                # Read current mastery + per-skill fitted BKT params from Neo4j
+                p_before, p_slip, p_guess, p_transit = _get_student_mastery_and_params(
+                    neo_sess, state.student_id, nid
+                )
 
-                # Apply misconception penalty before BKT
+                # Apply misconception penalty (LLM layer signal)
                 std_code = r.get("standard_code", "")
                 penalty = state.misconception_weights.get(std_code, 0.0)
                 p_before_adj = max(0.05, p_before - penalty)
 
-                # BKT update
-                p_after = _bkt_update(p_before_adj, r["is_correct"])
+                # Pull φ from the Signal Bridge output (defaults by correctness if absent)
+                qid = r.get("question_id", "")
+                phi_entry = state.phi_signals.get(qid, {})
+                if phi_entry:
+                    phi = float(phi_entry.get("phi", 1.0 if r["is_correct"] else 0.0))
+                else:
+                    # No chat signal available — fall back to time-based fidelity
+                    phi = 0.5 if r.get("is_likely_guess") else (1.0 if r["is_correct"] else 0.0)
+
+                # φ-modulated BKT update
+                p_after = _bkt_update(p_before_adj, r["is_correct"], p_slip, p_guess, p_transit, phi)
 
                 # Count attempts/correct in Neo4j
                 count_r = neo_sess.run(
@@ -288,6 +466,7 @@ def update_bkt(state: AssessmentState) -> dict:
                     "mastery_before": round(p_before, 3),
                     "mastery_after":  round(p_after, 3),
                     "rasch_mastery":  round(p_after, 3),
+                    "phi":            round(phi, 3),
                 }
     except Exception as exc:
         logger.error(f"BKT update failed: {exc}")

@@ -1,25 +1,42 @@
-# Adaptive Learning Engine — Architecture
+# Adaptive Learning Engine — Full Architecture
 
-## The Big Picture
+## Conceptual Model
 
-An adaptive K1–K8 educational assessment engine with an integrated AI Tutor. Instead of handing every student the same test, the system selects questions personalized to each student's current ability using Item Response Theory, evaluates answers with real learning-science algorithms, generates targeted remediation exercises, and then lets the student chat with an AI tutor that is fully grounded in their actual results.
+The engine is a **Hybrid Cognitive System** — two "brains" working together:
+
+| System | Role | Analogy |
+|---|---|---|
+| **Rasch IRT + BKT + KST** | Measures, calculates, and tracks with precision | The Cerebellum — balance, weights, calibrated path |
+| **Gemini (LLM)** | Reads the student's "vibe", interprets chat, diagnoses misconceptions | The Sensory Nervous System — qualitative signal interpreter |
+| **φ Signal Bridge** | Translates LLM qualitative output into a BKT numeric delta | The missing link connecting the two brains |
+
+The φ (Fidelity Factor) is the central innovation: instead of the LLM and the algorithm running in parallel and ignoring each other, φ is the number that lets Gemini's reading of the student's chat directly modify the BKT mastery update equation. Every node in the LangGraph pipeline either produces a signal or consumes one.
+
+---
+
+## System Topology
 
 ```
 Student (browser)
     │
     ▼
 Next.js Frontend (localhost:3000)
-    │ POST /api/v1/assessment/generate      — Phase A: adaptive question set
-    │ POST /api/v1/assessment/evaluate      — Phase B: full evaluation pipeline
-    │ POST /api/v1/chat/tutor               — AI Tutor (post-assessment)
-    │ POST /api/v1/chat/standalone          — AI Tutor (any time, from live mastery)
-    │ GET  /api/v1/chat/context/{id}        — Load student mastery context
+    │
+    │  POST /api/v1/assessment/generate        Phase A: adaptive question set
+    │  POST /api/v1/assessment/evaluate        Phase B: full 20-node pipeline
+    │  POST /api/v1/assessment/exercise_complete   live exercise BKT update + EMA
+    │  POST /api/v1/assessment/exercise_chat   live chat → φ signal → recursive pivot
+    │  POST /api/v1/chat/tutor                 post-assessment AI Tutor
+    │  POST /api/v1/chat/standalone            always-on AI Tutor
+    │  GET  /api/v1/chat/context/{id}          load mastery profile
+    │
     ▼
 FastAPI Backend (localhost:8000)
     │
-    ├─ Phase A LangGraph ──► Neo4j KG + Gemini Flash
-    ├─ Phase B LangGraph ──► Neo4j KG + Gemini Flash + Postgres
-    └─ AI Tutor ───────────► Neo4j KG + Gemini 2.5 Pro
+    ├─ Phase A LangGraph (4 nodes) ──────────► Neo4j KG + Gemini Flash
+    ├─ Phase B LangGraph (20 nodes) ─────────► Neo4j KG + Gemini Flash + Postgres
+    ├─ exercise_chat endpoint ───────────────► Neo4j + Gemini Flash (real-time)
+    └─ AI Tutor (chat.py) ───────────────────► Neo4j KG + Gemini 2.5 Pro
 ```
 
 ---
@@ -28,290 +45,411 @@ FastAPI Backend (localhost:8000)
 
 | Layer | Technology | What it stores |
 |---|---|---|
-| **Graph DB** | Neo4j (Docker `ale-neo4j`) | 144K+ `StandardsFrameworkItem` nodes (CCSS, TEKS, etc.) with `BUILDS_TOWARDS`, `PRECEDES`, `HAS_CHILD` edges; `SKILL_STATE` edges per student |
-| **Relational DB** | Postgres (Docker `ale-postgres`) | `AssessmentSession` rows, student records |
-| **LLM** | Gemini 2.0 Flash (question gen) + Gemini 2.5 Pro (AI Tutor) via Vertex AI REST | Question generation, misconception diagnosis, remediation, recommendations, tutoring |
-| **Backend** | FastAPI + LangGraph + Poetry venv | Orchestrates all agents |
-| **Frontend** | Next.js + TailwindCSS | Assessment UI, results display, AI Tutor chat |
+| **Graph DB** | Neo4j 5 (Docker `ale-neo4j`) | 144K+ `StandardsFrameworkItem` nodes; `SKILL_STATE`, `TEMPORARY_BLOCK`, `ATTEMPTED` edges per student; `BUILDS_TOWARDS`/`PRECEDES` edges with learned `conceptual_weight` |
+| **Relational DB** | PostgreSQL 15 (Docker `ale-postgres`) | `AssessmentSession`, `AssessmentAnswer`, `ChatSession`, `FailureChain` tables |
+| **LLM** | Gemini 2.0 Flash (pipeline) + Gemini 2.5 Pro (tutor) via Vertex AI REST / GenAI SDK | Question generation, Dynamic Weight Auditor (φ), misconception diagnosis, remediation, bridge instructions, tutoring |
+| **Backend** | Python 3.10+, FastAPI, LangGraph, Poetry | Orchestrates all agents |
+| **Frontend** | Next.js 14, TypeScript, TailwindCSS | Assessment UI, results, chat, parent dashboard |
 
 ---
 
-## The Two-Layer Agent System
-
-There are **two separate agent implementations** that coexist in the repo — a legacy one and the active new one.
-
-### Old system: `backend/app/agent/` (legacy, dormant)
+## Phase A — Adaptive Question Generation (4 nodes)
 
 ```
-backend/app/agent/
-  state.py       ← shared AssessmentState schema, still imported by new system
-  graph.py       ← OLD two-phase LangGraph (simple flat nodes)
-  nodes.py       ← OLD node functions (select_standards, evaluate_answers…)
-```
+API call: POST /generate  {grade, subject, student_id, state, num_questions}
+                │
+                ▼
+   _load_student_theta
+      MATCH (s:Student)-[r:SKILL_STATE]->()
+      mean_p = avg(r.p_mastery) → θ = logit(mean_p)
+      New students → θ = 0.0
+                │
+                ▼
+   [1] select_standards_irt
+      Cypher query: StandardsFrameworkItem nodes
+        WHERE gradeLevelList = grade
+          AND academicSubject = subject
+          AND jurisdiction = state
+          AND normalizedStatementType = 'Standard'
+          AND NOT n.identifier IN $already_asked        ← elastic stopping exclusion
+          AND NOT EXISTS {                               ← cognitive load pruning
+            MATCH (:Student {id:$sid})-[:TEMPORARY_BLOCK]->(n)
+          }
+      + prerequisite grade (grade-1) nodes
+      + BUILDS_TOWARDS / HAS_DEPENDENCY / DEFINES_UNDERSTANDING edges
+      Fisher Information ranking: I(θ,β) = P*(1-P)  where P = sigmoid(θ-β)
+      Multi-domain nodes get 1.5× intersection bonus
+                │
+                ▼
+   [2] fetch_rag_context
+      Per node: prereqs (BUILDS_TOWARDS → n),
+                sibling standards (same grade+subject),
+                existing question stems (GeneratedQuestion → TESTS → n)
+      Builds rag_prompt_block injected into Gemini prompt
+                │
+                ▼
+   [3] generate_questions
+      Gemini Flash → JSON array of N questions
+      A/B/C/D options, correct answer, dok_level,
+      standard_code, node_index for node_ref linkage
+      Visual/image questions blocked (text-only enforcement)
 
-This was the original flat agent. **The API no longer calls this code.** `state.py` is still imported by the new agents — it holds the shared `AssessmentState` Pydantic model.
-
-### New system: `backend/app/agents/` (active — what the API calls)
-
-```
-backend/app/agents/
-  orchestrator.py          ← NEW LangGraph, imports from all agents below
-  assessment_agent.py      ← Phase A: IRT-ranked standards + RAG + Gemini questions
-  evaluation_agent.py      ← Phase B steps 1–4: score + Rasch + misconceptions + BKT
-  gap_agent.py             ← Phase B step 5: KST gap analysis + ranking
-  remediation_agent.py     ← Phase B step 6: Gemini targeted exercises
-  recommendation_agent.py  ← Phase B step 7: ZPD frontier + Gemini learning path
-  rasch.py                 ← Rasch 1PL IRT math library
-  kst.py                   ← Knowledge Space Theory propagation
-  irt_selector.py          ← Maximum Information Gain selector
-  vertex_llm.py            ← Unified Gemini/Vertex LLM client (generate + chat)
-```
-
-The FastAPI routes in `api/routes/assessment.py` import from `orchestrator.py`.
-The AI Tutor lives entirely in `api/routes/chat.py`.
-
----
-
-## Phase A — Question Generation
-
-```
-API receives: {grade, subject, student_id, state, num_questions}
-                    │
-                    ▼
-        1. _load_student_theta
-           MATCH (s:Student {id})-[r:SKILL_STATE]->()
-           mean_p = avg(r.p_mastery) → θ = logit(mean_p)
-           New students → θ = 0.0
-                    │
-                    ▼
-        assessment_agent: select_standards_irt
-           ┌─────────────────────────────────────┐
-           │ Cypher → StandardsFrameworkItem       │
-           │   WHERE gradeLevelList = grade        │
-           │     AND academicSubject = subject     │
-           │     AND jurisdiction = state          │
-           │   Fallback to Multi-State if < 3 hits │
-           │ + prerequisite grade (grade-1) nodes  │
-           │ + BUILDS_TOWARDS / HAS_DEPENDENCY /   │
-           │   DEFINES_UNDERSTANDING edges for IRT │
-           └─────────────────────────────────────┘
-                    │
-                    ▼
-        irt_selector: rank_nodes_by_information
-           β = grade_to_difficulty(grade, dok_level, category)
-           info = P*(1-P) where P = sigmoid(θ - β)
-           Multi-domain nodes get 1.5× intersection bonus
-           Target: 7-12 target nodes, 3-5 prereq nodes
-           Cap at settings.agent_max_questions (10)
-           Prereq/target ratio preserved when capping
-                    │
-                    ▼
-        assessment_agent: fetch_rag_context
-           Per node: prereqs (BUILDS_TOWARDS → n),
-           sibling standards (same grade+subject),
-           existing question stems (GeneratedQuestion → TESTS → n)
-           Builds rag_prompt_block text for Gemini
-                    │
-                    ▼
-        assessment_agent: generate_questions
-           Gemini Flash call → JSON array of N questions
-           A/B/C/D options, correct answer, dok_level,
-           standard_code, node_index for node_ref linkage
-           generate_json() unwraps dict wrappers + retries once
-```
-
-**Output to frontend:** `assessment_id`, `questions[]`, `theta`, `question_difficulties`, `core_standards`.
-
----
-
-## Phase B — Evaluation Pipeline
-
-```
-API receives: {assessment_id, student_id, answers[]}
-                    │
-                    ▼
-   evaluation_agent: score_answers
-      q_map = {question_id: question} from state.questions
-      Compare selected_answer vs q["answer"] → is_correct
-      score = correct_count / total
-                    │
-                    ▼
-   evaluation_agent: update_rasch
-      RaschSession(initial_theta=θ)
-      For each answer in submission order:
-        θ = update_theta(θ, β, is_correct)
-        Δθ = 0.5 * (observed - P(θ,β)) / I(θ,β)
-        θ clamped to [-4.0, +4.0]
-      Produces theta, theta_history[], SE, grade_equivalent
-                    │
-                    ▼
-   evaluation_agent: detect_misconceptions
-      Wrong answers (up to 6) → Gemini Flash prompt:
-      "What misconception led to this error?"
-      Returns: [{question_id, standard_code, misconception,
-                 affected_standards[], mastery_penalty}]
-      Penalties accumulated per standard (max 0.5 total per node)
-                    │
-                    ▼
-   evaluation_agent: update_bkt
-      For each tested node:
-        p_before = Neo4j SKILL_STATE r.p_mastery (or P_INIT=0.1)
-        p_before_adj = max(0.05, p_before - misconception_penalty)
-        p_after = BKT_update(p_before_adj, is_correct)
-        MERGE SKILL_STATE with p_mastery, attempts, correct, last_updated
-                    │
-                    ▼
-   gap_agent: identify_and_rank_gaps
-      Fetch PRECEDES / BUILDS_TOWARDS / HAS_CHILD edges (2-hop)
-      Downstream impact count per tested node
-      Run KST propagation (see below)
-      Gaps = nodes where KST mastery < 0.55
-      Rank: hard-blocked first → downstream_count desc → mastery asc
-      Cap at 8 gaps reported
-                    │
-          ┌─────────┴──────────┐
-        gaps?                no gaps
-          │                    │
-          ▼                    ▼
-   remediation_agent      skip remediation
-      Per gap (up to 5):
-        is_hard or mastery < 0.25 → "foundational re-teaching" (DOK 1)
-        mastery < 0.45           → "guided practice" (DOK 2)
-        else                     → "application & problem-solving" (DOK 2)
-        Gemini generates 3 exercises with hint + answer + explanation
-        Exercises informed by misconception context
-      Ordered: hard-blocked first, then by mastery ascending
-          │
-          ▼
-   recommendation_agent
-      identify_frontier(knowledge_state, edges, threshold=0.60)
-        frontier = unmastered nodes whose all prereqs ARE mastered
-        Fallback: lowest-mastery unblocked nodes
-      Score frontier by Fisher Information I(θ,β) at student θ
-      Top 5 frontier nodes → Gemini:
-        why_now, how_to_start, estimated_minutes, difficulty label
-      Output: rank, standard_code, description, success_prob,
-              current_mastery, information_score
-                    │
-                    ▼
-   write_report → return full result to frontend
+Output: assessment_id, questions[], theta, framework, core_standards
 ```
 
 ---
 
-## AI Tutor System (`api/routes/chat.py`)
-
-The AI Tutor is a fully separate feature from the assessment pipeline. It uses **Gemini 2.5 Pro** for stronger pedagogical reasoning. There are two modes:
-
-### Mode 1 — Post-Assessment Tutor (`POST /api/v1/chat/tutor`)
-
-Used immediately after an assessment. The frontend sends the complete `EvalResult` payload as `context`. The tutor knows:
-- Exact score, θ, grade status, correct/incorrect counts
-- Every gap with its mastery %, priority, and hard-block status
-- Every LLM-detected misconception with standard code
-- Every ZPD recommendation with why_now, how_to_start, estimated_minutes
-- Every wrong answer (question text, student answer, correct answer)
-
-The system prompt (`_build_system_prompt`) builds a structured document with sections:
-```
-=== STUDENT PROFILE ===        — grade, score, θ, status
-=== KNOWLEDGE GAPS (N) ===     — per gap: code, desc, mastery%, priority, hard-blocked flag
-=== DETECTED MISCONCEPTIONS === — per misconception: code + root cause
-=== NEXT LEARNING STEPS ===    — ZPD frontier items with why/how/time
-=== QUESTIONS ANSWERED INCORRECTLY === — up to 6 wrong Q+A pairs
-=== TUTORING GUIDELINES ===    — 10 behavioural rules for the tutor
-```
-
-Request shape:
-```json
-{
-  "student_id": "...",
-  "grade": "K5",
-  "subject": "math",
-  "message": "Can you explain what I got wrong on fractions?",
-  "history": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}],
-  "context": { /* full EvalResult payload */ }
-}
-```
-
-### Mode 2 — Standalone Tutor (`POST /api/v1/chat/standalone`)
-
-Works any time, not just after an assessment. Fetches live mastery data from Neo4j via `GET /chat/context/{student_id}` and builds a different system prompt (`_build_system_from_mastery`):
+## Phase B — Full Evaluation Pipeline (20 nodes)
 
 ```
-Standards assessed: N/total  |  Mean mastery: X%
-=== KNOWLEDGE GAPS (N standards below 55% mastery) ===
-=== STRENGTHS (above 70% mastery) ===
-=== MASTERY BY GRADE ===     — per-grade count + avg mastery
-=== RECENTLY ASSESSED STANDARDS ===
-=== TUTORING GUIDELINES ===
+API call: POST /evaluate  {assessment_id, student_id, answers[], confusion_signal?, total_answered_prior?}
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  ENTRY                                                                   │
+  │  [1] detect_confusion_signal                                             │
+  │      Checks state.confusion_signal flag (set when student types          │
+  │      "I don't get this" in chat without completing answers)              │
+  └───────────┬─────────────────────────────────────────────────────────────┘
+              │
+    ┌─────────┴────────────────┐
+    │ confused=True            │ confused=False
+    ▼                          ▼
+  [2a] lca_confusion        [3] score_answers
+       BFS backward via           Compare submitted vs correct
+       BUILDS_TOWARDS to          Capture time_ms per question
+       nearest mastered           Flag is_likely_guess (correct + <4s)
+       ancestor (p≥0.95)          Include chat_message per answer
+       → lca_safety_nets{}        → results[], score, time_per_question{}
+          │                            │
+          ▼                            ▼
+      write_report ←         [4] chat_to_signal  ← THE SIGNAL BRIDGE
+      (early exit with            Dynamic Weight Auditor (Gemini)
+       scaffold anchor)           For each answered question:
+                                  Analyzes: chat_message + time_ms + correctness + dok
+                                  Outputs: φ ∈ [-1.0, 1.0] per question_id
+                                  φ = 1.0  Fluent (genuine understanding)
+                                  φ = 0.5  Partial (hesitant / "I think...")
+                                  φ = 0.2  Brittle (very fast, likely guess)
+                                  φ = 0.0  Neutral (wrong, BKT handles)
+                                  φ = -0.5 Struggling (specific hurdle)
+                                  φ = -1.0 Hard Block ("I don't get this")
+                                  Fallback: heuristic from time_ms if LLM fails
+                                  → phi_signals{}, session_context[]
+                                       │
+                                       ▼
+                               [5] update_rasch
+                                   RaschSession(initial_theta=θ)
+                                   For each answer in order:
+                                     θ = update_theta(θ, β, is_correct)
+                                   Produces: theta, theta_history[], se, total_answered
+                                       │
+                                       ▼
+                               [6] check_stopping_criterion
+                                   Elastic Stopping Gate:
+                                   SE = 1 / sqrt(Σ I(θ,β_i))
+                                       │
+                          ┌────────────┴─────────────┐
+                   SE ≥ 0.3                      SE < 0.3
+                   AND count < 25              OR count ≥ 25
+                          │                          │
+                          ▼                          ▼
+           [7a] generate_follow_up_questions    [7b] detect_misconceptions
+                Calls Phase A agents inline          Wrong answers → Gemini Flash
+                Excludes already-asked nodes         "What misconception led to this?"
+                Returns FOLLOWUP_BATCH=5 new         Returns [{standard_code,
+                questions                             misconception, root_prereq_code,
+                needs_more_questions=True             affected_standards[], penalty}]
+                → additional_questions[]             Back-propagates to root prereq
+                → write_report (partial)             nodes in Neo4j
+                                                          │
+                                                          ▼
+                                                    [8] lca_misconception
+                                                        BFS backward for each
+                                                        root_prerequisite_code
+                                                        → lca_safety_nets{}
+                                                             │
+                                                             ▼
+                                                    [9] update_bkt  ← φ-MODIFIED FORMULA
+                                                        For each tested node:
+                                                          φ = phi_signals[qid].phi
+                                                          p_before_adj -= misconception_penalty
+                                                          TRADITIONAL BKT POSTERIOR:
+                                                            P(L|correct) = P(L)(1-slip)/denom
+                                                            P(L|wrong)   = P(L)slip/denom
+                                                          φ-MODULATED TRANSITION:
+                                                            P(L_{t+1}) = P(L|obs)
+                                                                       + (1-P(L|obs))*(p_transit*φ)
+                                                          φ<0 → un-learning (mastery decreases)
+                                                          Writes p_mastery to Neo4j SKILL_STATE
+                                                          Logs phi per result
+                                                             │
+                                                             ▼
+                                                    [10] consolidate_memory
+                                                         Persist GeneratedQuestion nodes
+                                                         (:Student)-[:ATTEMPTED]->(:GeneratedQuestion)
+                                                                  -[:TESTS]->(:StandardsFrameworkItem)
+                                                         EMA update on BUILDS_TOWARDS edges:
+                                                           new_weight = old*0.95 + signal*0.05
+                                                             │
+                                                             ▼
+                                                    [11] load_exercise_memory
+                                                         Fetch prior exercise history
+                                                         from Neo4j for all assessed standards
+                                                         → exercise_memory{}
+                                                             │
+                                                             ▼
+                                                    [12] identify_and_rank_gaps
+                                                         Fetch 2-hop KG subgraph
+                                                         KST propagation on subgraph
+                                                         Gaps = nodes where KST < 0.55
+                                                         Rank: hard-blocked → downstream → mastery
+                                                         Cap at 8 gaps
+                                                         COGNITIVE LOAD PRUNING:
+                                                           For each hard-blocked node:
+                                                             MATCH downstream *1..4 hops
+                                                             CREATE (:Student)-[:TEMPORARY_BLOCK
+                                                               {blocked_by, created_at}]->(:SFI)
+                                                           → newly_blocked_nodes[]
+                                                             │
+                                              ┌─────────────┴─────────────┐
+                                          has gaps                    no gaps
+                                              │                           │
+                                              ▼                           ▼
+                                    [13] generate_remediation        skip to [14]
+                                         Per gap (up to 5):
+                                         Injects NanoPoint metadata tag:
+                                           [NanoPoint_ID: {node_id} |
+                                            Standard: {code} |
+                                            Difficulty: {mastery:.2f} |
+                                            DOK: {dok_target}]
+                                         DOK 1: foundational re-teaching
+                                         DOK 2: guided practice / application
+                                         Informs Gemini of prior exercises
+                                           (avoids repetition)
+                                         Returns 3 exercises per gap with
+                                           hint, answer, explanation
+                                              │
+                                              ▼
+                                    [14] judge_mastery  (both paths converge)
+                                         Gemini holistic mastery verdict
+                                         per standard. Considers:
+                                           BKT before/after
+                                           This session's answers
+                                           Full exercise history trend
+                                           DOK level of correct vs incorrect
+                                         Returns mastery_verdicts{}:
+                                           {verdict, confidence, reasoning,
+                                            next_action, override_mastery}
+                                              │
+                                              ▼
+                                    [15] apply_fidelity_correction
+                                         Neuro-Symbolic fidelity pass.
+                                         For each correct answer:
+                                           signal_1 (time): is_likely_guess → factor=0.5
+                                           signal_2 (LLM): struggling verdict → factor=0.5
+                                                           mastered+challenge → factor=1.2
+                                         Applies factor only to the GAIN:
+                                           corrected = p_before + gain * factor
+                                         Writes corrected p_mastery to Neo4j
+                                           with fidelity_factor property
+                                              │
+                                              ▼
+                                    [16] generate_recommendations
+                                         KST frontier identification:
+                                           unmastered nodes whose ALL prereqs
+                                           ARE mastered (ZPD boundary)
+                                         Scores frontier by I(θ,β)
+                                           prefer β ≈ θ (50% success zone)
+                                         Gemini: why_now, how_to_start,
+                                           estimated_minutes, difficulty
+                                              │
+                                              ▼
+                                    [17] llm_recommendation_decider
+                                         Final LLM pass:
+                                           Filter already-mastered concepts
+                                           Reprioritize: remediate first
+                                           Add decision_reasoning per item
+                                           Produce session_narrative (2 sentences)
+                                           Pick focus_concept
+                                              │
+                                              ▼
+                                    [18] write_report → END
+                                         Logs final summary
+                                         Returns {} (state already populated)
 ```
-
-### `GET /api/v1/chat/context/{student_id}` — Mastery Context Loader
-
-Queries Neo4j `SKILL_STATE` edges for a student and returns a structured profile:
-```json
-{
-  "student_id": "...",
-  "has_history": true,
-  "total_assessed": 47,
-  "total_in_kg": 144000,
-  "mean_mastery": 0.612,
-  "gaps": [ /* 10 lowest-mastery standards (< 55%) */ ],
-  "strengths": [ /* 8 highest-mastery standards (>= 70%) */ ],
-  "recent": [ /* 8 most recently updated standards */ ],
-  "grade_breakdown": { "3": {"count": 12, "mean_mastery": 0.71}, ... }
-}
-```
-
-Supports optional `grade` and `subject` query params to filter the SKILL_STATE query.
-
-### Multi-Turn Chat (`VertexLLM.chat()`)
-
-The tutor endpoints call `llm.chat(system, history, message, model)`, which builds a native Gemini multi-turn payload:
-```json
-{
-  "systemInstruction": {"parts": [{"text": "<system_prompt>"}]},
-  "contents": [
-    {"role": "user", "parts": [{"text": "..."}]},
-    {"role": "model", "parts": [{"text": "..."}]},
-    {"role": "user", "parts": [{"text": "<current_message>"}]}
-  ],
-  "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4096}
-}
-```
-
-Falls back to flattened single-prompt format if REST call fails. Note: `"assistant"` history role is translated to `"model"` for Gemini's API.
 
 ---
 
-## The Shared State Object
+## Live Exercise Session — The "Back and Forth"
 
-`AssessmentState` (`agent/state.py`) flows through the entire LangGraph. Each node returns only the keys it modifies.
+### `POST /assessment/exercise_chat`
 
-| Field | Type | What it holds |
-|---|---|---|
-| `student_id` | `str` | Student identifier |
-| `grade` | `str` | Grade level (K1–K8) |
-| `subject` | `str` | "math" or "english" |
-| `state_jurisdiction` | `str` | US state abbrev or "Multi-State" |
-| `framework` | `str` | Standards framework name |
-| `theta` | `float` | Rasch ability logit (-4 to +4) |
-| `theta_history` | `list[float]` | θ after each answer |
-| `question_difficulties` | `dict[str, float]` | node_id → β (difficulty logit) |
-| `knowledge_state` | `dict[str, float]` | node_id → inferred mastery (KST) |
-| `hard_blocked_nodes` | `list[str]` | nodes locked by failed hard prereqs |
-| `misconceptions` | `list[dict]` | LLM-detected misconceptions per wrong answer |
-| `misconception_weights` | `dict[str, float]` | mastery penalty per standard code |
-| `gaps` | `list[dict]` | ranked knowledge gaps |
-| `remediation_plan` | `list[dict]` | 3 exercises per gap |
-| `recommendations` | `list[dict]` | ZPD learning path (up to 5 items) |
-| `mastery_updates` | `dict[str, float]` | BKT P(mastery) output per node |
-| `all_nodes` | `list[dict]` | IRT-selected standards for this assessment |
-| `results` | `list[dict]` | per-answer outcome enriched by Rasch + BKT |
-| `score` | `float` | fraction correct 0–1 |
-| `rag_context_map` | `dict` | per-node RAG context from Neo4j |
-| `rag_prompt_block` | `str` | formatted text block injected into question-gen prompt |
+The real-time signal bridge for remediation exercises. Called whenever the student types in the chatbox during an exercise.
+
+```
+Frontend sends:
+  {student_id, node_identifier, standard_code, concept,
+   exercise_text, nanopoint_tag, chat_message,
+   answer?, correct?, time_ms, beta}
+        │
+        ▼
+   Step 1 — Compute φ (Gemini Dynamic Weight Auditor)
+     Prompt includes: exercise context, nanopoint_tag, chat_message, time_ms
+     Returns: {phi, reason, gap_tag}
+     Falls back to time heuristic if LLM fails
+        │
+        ▼
+   Step 2 — φ-Modified BKT Update (immediate write to Neo4j)
+     P(L_{t+1}) = P(L|obs) + (1 - P(L|obs)) * (p_transit * φ)
+     When φ = -1.0:
+       P(L_{t+1}) = P(L|obs) - (1 - P(L|obs)) * p_transit
+       Mastery actively pulled DOWN — un-learning
+        │
+        ▼
+   Step 3 — Recursive Pivot (if φ < -0.3)
+     The "Back":
+       compute_pivot() calls find_lca(driver, student_id, node_identifier)
+       BFS backward through BUILDS_TOWARDS (up to 6 hops)
+       Finds nearest mastered ancestor (p_mastery ≥ 0.95)
+     The "Bridge":
+       Gemini generates 2-3 sentence bridge instruction:
+         "Good news — you already understand {anchor}!
+          Let's use that knowledge as our starting point to figure out {target}.
+          Ready to try again?"
+     The "Forth":
+       After student nails the pivot exercise (φ → 1.0),
+       frontend resumes original exercise with bridge framing
+        │
+        ▼
+   Step 4 — FailureChain audit (if φ < -0.3)
+     INSERT into PostgreSQL failure_chains:
+       {student_id, failed_node_id, failed_node_code,
+        root_prereq_node_id, root_prereq_code,
+        signal_source: "phi_negative", hops_to_lca}
+        │
+        ▼
+   Returns:
+     {phi, reason, gap_tag,
+      p_mastery_before, p_mastery_after,
+      pivot_needed, pivot_node, bridge_instruction}
+```
+
+### Chat Signal Reference Table
+
+| Student input | φ | BKT effect | Action |
+|---|---|---|---|
+| "Oh! I see, just multiply the base" | 1.0 | Full gain | Continue |
+| Correct at reasonable speed | 0.7 | Standard gain | Continue |
+| "I think it's this?" | 0.5 | Half gain | Continue (brittle flag) |
+| Correct in < 3s on DOK ≥ 2 | 0.2 | Tiny gain | Flag for fidelity review |
+| Wrong answer, no chat | 0.0 | BKT posterior handles loss | Continue |
+| "I got the first part but not second" | -0.5 | Un-learning starts | Note partial gap |
+| "I don't get why the 4 moved there" | -1.0 | Active un-learning | **Trigger recursive pivot** |
+
+---
+
+## The φ-Modified BKT Formula
+
+### Standard BKT (old)
+
+```
+P(L_{t+1}) = P(L_t|Obs) + (1 - P(L_t|Obs)) * p_transit
+```
+
+### Neuro-Symbolic BKT (new)
+
+```
+Step 1 — Bayes posterior (unchanged):
+  if correct: P(L|obs) = P(L)(1-slip)  / [P(L)(1-slip) + (1-P(L))guess]
+  if wrong:   P(L|obs) = P(L)slip      / [P(L)slip + (1-P(L))(1-guess)]
+
+Step 2 — φ-modulated transition:
+  P(L_{t+1}) = P(L_t|Obs) + (1 - P(L_t|Obs)) * (p_transit * φ)
+
+  φ = 1.0  → full transition gain (genuine mastery signal)
+  φ = 0.5  → half gain (brittle mastery)
+  φ = 0.0  → no transition (mastery frozen at posterior)
+  φ = -1.0 → P(L_{t+1}) = P(L|obs) - (1 - P(L|obs)) * p_transit
+              (un-learning: mastery pulled below the posterior)
+
+Step 3 — Clamped to [0.01, 0.999]
+```
+
+### φ Sources (signal priority)
+
+1. **chat_to_signal** (Gemini Dynamic Weight Auditor): reads `chat_message`, `time_ms`, `correctness` per question → primary φ source during assessment Phase B
+2. **exercise_chat** (inline Gemini call): reads live chat during a remediation exercise → real-time φ for the Back-and-Forth
+3. **Heuristic fallback**: `is_likely_guess` flag from `score_answers` (correct in < 4s) → φ = 0.5; normal correct → φ = 1.0; wrong → φ = 0.0
+
+---
+
+## Elastic Stopping (Computerized Adaptive Testing)
+
+The assessment does not always ask a fixed number of questions. It stops when the Standard Error of θ drops below the precision threshold.
+
+```
+SE = 1 / sqrt(Σ I(θᵢ, βᵢ))    where I(θ,β) = P(1-P)
+
+After each answer batch:
+  if SE < 0.30 OR total_answered ≥ 25:
+    → continue to full Phase B evaluation
+  else:
+    → generate_follow_up_questions (5 more, excluding already-asked)
+    → return needs_more_questions: true + additional_questions[] to frontend
+    → frontend submits next batch with total_answered_prior count
+```
+
+Phase A's `select_standards_irt` always excludes nodes already asked this session (`NOT n.identifier IN $asked_ids`) so follow-up questions are always novel.
+
+---
+
+## Cognitive Load Pruning (TEMPORARY_BLOCK)
+
+When `identify_and_rank_gaps` finds a hard block (failed prereq with `conceptual_weight ≥ 0.9`), it writes block relationships to all downstream nodes:
+
+```cypher
+MATCH (s:Student {id: $sid})
+MATCH (blocker:StandardsFrameworkItem {identifier: $nid})
+    -[:BUILDS_TOWARDS|PRECEDES*1..4]->(downstream)
+MERGE (s)-[b:TEMPORARY_BLOCK]->(downstream)
+ON CREATE SET b.blocked_by = $nid, b.created_at = $now
+```
+
+**Effect:** Next time the student takes an assessment, `select_standards_irt` filters these out. The student cannot be presented with concepts they literally cannot access yet. This prevents the "Overwhelmed" student state.
+
+**Unblocking:** When the student masters the blocking node via `exercise_complete` (p_mastery ≥ 0.65):
+
+```cypher
+MATCH (s:Student {id: $sid})-[b:TEMPORARY_BLOCK]->(n)
+WHERE b.blocked_by = $blocker_nid
+DELETE b
+```
+
+---
+
+## Fidelity Correction Layer
+
+`apply_fidelity_correction` runs after `judge_mastery` and applies a final correction to the BKT gain that was already written by `update_bkt`. It corrects for over-crediting.
+
+```python
+For each correct answer result:
+  factor = 1.0  # default
+
+  # Signal 1 — time-based
+  if is_likely_guess (correct + < 4s + DOK≥2):
+    factor = min(factor, 0.5)
+
+  # Signal 2 — LLM verdict
+  if judge_mastery verdict="struggling" and is_correct:
+    factor = min(factor, 0.5)   # correct answer was a fluke
+  elif judge_mastery verdict="mastered" and next_action="challenge":
+    factor = max(factor, 1.2)   # genuine mastery, small bonus
+
+  corrected_mastery = p_before + (p_after - p_before) * factor
+  → written to Neo4j SKILL_STATE with fidelity_factor property
+```
+
+This is distinct from the φ correction in `update_bkt` — φ modifies the *transition formula*, fidelity correction adjusts the *final persisted value* after LLM review.
 
 ---
 
@@ -321,62 +459,44 @@ Falls back to flattened single-prompt format if REST call fails. Note: `"assista
 
 ```
 P(correct | θ, β) = 1 / (1 + e^-(θ-β))
-Fisher Information I(θ,β) = P * (1 - P)
+Fisher Information: I(θ,β) = P * (1 - P)     ← peaks at 0.25 when θ=β
 θ update (Newton-Raphson): θ += 0.5 * (observed - P) / I(θ,β)
   clamped to [-4.0, +4.0]
-Standard Error: SE = 1 / sqrt(Σ I(θ,β))
-Grade equivalent: θ → nearest grade in GRADE_DIFFICULTY map
+Standard Error: SE = 1 / sqrt(Σ I(θᵢ,βᵢ))
 ```
 
-- **θ (theta)** = student ability logit. Starts at 0.0 (average). Range -4 to +4.
-- **β (beta)** = question difficulty logit. Grade 1 = -2.0, Grade 5 = 0.0, Grade 8 = +1.5.
-- **STEP_SIZE = 0.5** — learning rate for Newton-Raphson step.
-- DOK level adds offset: DOK 1 = -0.5, DOK 2 = 0.0, DOK 3 = +0.5, DOK 4 = +1.0.
-- Prerequisite category subtracts 0.5 from base β.
-- `RaschSession.to_dict()` returns `{theta, se, grade_equivalent, n_items, history}`.
+**Grade → β difficulty map:**
 
-**Grade → difficulty mapping:**
-| Grade | β logit |
-|---|---|
-| K | -3.0 |
-| 1 | -2.0 |
-| 2 | -1.5 |
-| 3 | -1.0 |
-| 4 | -0.5 |
-| 5 | 0.0 |
-| 6 | +0.5 |
-| 7 | +1.0 |
-| 8 | +1.5 |
-| 9+ | +2.0 |
+| Grade | β logit | | Grade | β logit |
+|---|---|---|---|---|
+| K | -3.0 | | 5 | 0.0 |
+| 1 | -2.0 | | 6 | +0.5 |
+| 2 | -1.5 | | 7 | +1.0 |
+| 3 | -1.0 | | 8 | +1.5 |
+| 4 | -0.5 | | 9+ | +2.0 |
 
-### Bayesian Knowledge Tracing (`agents/evaluation_agent.py`)
+DOK offset: DOK1 = -0.5, DOK2 = 0.0, DOK3 = +0.5, DOK4 = +1.0.
+Prerequisite category subtracts 0.5 from base β.
 
-Classic 4-parameter Hidden Markov model:
-```python
-P_INIT  = 0.10   # prior probability of mastery
-P_LEARN = 0.20   # probability of learning after each attempt
-P_SLIP  = 0.10   # P(wrong | mastered)
-P_GUESS = 0.20   # P(correct | not mastered)
+### Bayesian Knowledge Tracing (BKT)
 
-if correct:
-    posterior = p_mastery * (1 - P_SLIP) / denominator
-else:
-    posterior = p_mastery * P_SLIP / denominator
+Parameters (system defaults; per-skill values fitted by Baum-Welch EM override these):
 
-p_after = posterior + (1 - posterior) * P_LEARN
+```
+P_INIT    = 0.10   prior probability of mastery
+P_TRANSIT = 0.10   probability of learning on next attempt
+P_SLIP    = 0.08   P(wrong | mastered)
+P_GUESS   = 0.25   P(correct | not mastered)
 ```
 
-**Misconception penalty applied before BKT:**
+Per-skill parameters are stored on `StandardsFrameworkItem` nodes as `bkt_p_slip`, `bkt_p_guess`, `bkt_p_transit` after Baum-Welch fitting (see `student/bkt_fitter.py`).
+
+The misconception penalty is applied before the BKT update:
 ```python
 p_before_adj = max(0.05, p_before - misconception_penalty)
 ```
-This ensures LLM-detected misconceptions lower mastery before the BKT update, not independently of it.
 
-Mastery state persisted as `SKILL_STATE` relationship edges in Neo4j after every assessment.
-
-### Knowledge Space Theory (`agents/kst.py`)
-
-After a ~10-question assessment, only ~10 nodes are directly observed. KST fills in the rest:
+### Knowledge Space Theory — KST (`agents/kst.py`)
 
 ```
 SUCCESS_DECAY  = 0.90   per hop downward (toward prereqs)
@@ -384,503 +504,396 @@ FAILURE_DECAY  = 0.70   per hop upward (toward advanced concepts)
 MAX_HOPS       = 3
 HARD_PREREQ_THRESHOLD  = 0.9   (edge weight ≥ 0.9 → hard block)
 HARD_BLOCK_MASTERY     = 0.05
+MASTERY_GAP_THRESHOLD  = 0.55  (below this = gap)
 ```
 
-- **Success propagation (downward):** If θ≥0.6 on a node, propagate `mastery * 0.90 * edge_weight` to prereqs, up to 3 hops.
-- **Failure propagation (upward):** If θ<0.4 on a node, propagate failure upward. Hard edges (weight≥0.9) → all children set to 0.05 (hard-blocked). Soft edges (weight 0.5–0.89) → penalise with 0.70 decay.
-- **Misconception penalty:** Subtracts `misconception_weight` from each affected node's KST mastery.
-- `identify_frontier()`: returns nodes below mastery_threshold=0.60 whose ALL prereqs are above that threshold — the ZPD "ready to learn" set.
+After a ~10-question assessment, only ~10 of 144K nodes are directly observed. KST fills in the rest by propagating signals through the `BUILDS_TOWARDS`/`PRECEDES` graph. `identify_frontier()` finds the ZPD: unmastered nodes whose ALL prerequisites ARE mastered.
 
-### Maximum Information Gain (`agents/irt_selector.py`)
+### LCA — Lowest Common Ancestor (`agents/lca_agent.py`)
 
-Select questions where `I(θ,β) = P*(1-P)` is maximised (peaks at 0.25 when θ=β):
+```cypher
+MATCH path = (ancestor)-[:BUILDS_TOWARDS*1..6]->(target_node)
+MATCH (student)-[:SKILL_STATE]->(ancestor)
+WHERE sk.p_mastery >= 0.95
+ORDER BY length(path) ASC LIMIT 1
+```
 
-- `rank_nodes_by_information(θ, candidates)` — returns all candidates sorted by information score.
-- `select_next_node(θ, candidates, already_asked, failed_ids, prereq_map)` — single-step selector (for live adaptive sessions).
-- **Intersection bonus:** nodes whose `domains` list has > 1 entry get score × 1.5.
-- **Prerequisite block:** if any parent of a node is in `failed_ids`, skip that node (threshold: p_correct < 0.35).
-- `assign_difficulties(nodes)` — pre-computes `{identifier: β}` for a batch.
-- `build_prerequisite_map(nodes)` — builds `{child_id: [parent_ids]}` from node dicts.
-
----
-
-## VertexLLM Client (`agents/vertex_llm.py`)
-
-Three-path fallback for `generate()`:
-
-1. **Generative Language REST** (`generativelanguage.googleapis.com`) — ADC Bearer token.
-2. **Vertex AI REST** (`aiplatform.googleapis.com`) — ADC Bearer token; tries `flash_model`, then `gemini-1.5-flash-001`, then `gemini-1.5-pro-001`.
-3. **google.generativeai SDK** — `GEMINI_API_KEY` from `.env`.
-
-Raises `RuntimeError` with setup instructions if all three fail.
-
-**`generate_json(prompt)`** — enhanced JSON generation:
-1. Appends `"Return ONLY valid JSON. No markdown fences."` to prompt.
-2. Tries twice (retries once on `None`).
-3. If result is a dict, auto-unwraps known wrapper keys: `questions`, `items`, `data`, `results`, `assessment`, `exercises`.
-4. `_parse_json()` strips markdown fences, tries `[...]` first then `{...}`.
-
-**`chat(system, history, message, model)`** — multi-turn conversation:
-- Builds native Gemini `systemInstruction` + `contents` payload.
-- Temperature 0.7, maxOutputTokens 4096.
-- Falls back to single flattened prompt via `generate()` if REST fails.
-- Default chat model: `gemini-2.5-pro` (configurable per endpoint).
-
-All agents call `get_llm()` which returns the module-level singleton `VertexLLM` instance.
+Returns the nearest mastered ancestor within 6 hops. Used by:
+- `lca_confusion` — when student sends confusion signal mid-assessment
+- `lca_misconception` — after misconceptions are detected
+- `compute_pivot()` — inside `exercise_chat` for recursive pivot
 
 ---
 
-## Neo4j Graph Database — Full Schema
+## AssessmentState — Full Field Reference (`agent/state.py`)
 
-### Live Node Counts (as of last import)
+| Field | Type | Populated by | Description |
+|---|---|---|---|
+| `student_id` | `str` | API | |
+| `grade` | `str` | API | Grade level (K1–K8) |
+| `subject` | `str` | API | "math" or "english" |
+| `state_jurisdiction` | `str` | API | US state or "Multi-State" |
+| `theta` | `float` | `update_rasch` | Rasch ability logit |
+| `theta_history` | `list[float]` | `update_rasch` | θ after each answer |
+| `se` | `float` | `update_rasch` | Standard Error of θ estimate |
+| `total_answered` | `int` | `update_rasch` | Cumulative questions answered |
+| `needs_more_questions` | `bool` | `generate_follow_up` | Elastic stopping flag |
+| `additional_questions` | `list[dict]` | `generate_follow_up` | Follow-up questions for frontend |
+| `confusion_signal` | `bool` | API | Student sent "I don't get this" |
+| `confusion_chat` | `str` | API | Raw chat message from student |
+| `lca_safety_nets` | `dict[str, Any]` | `lca_confusion` / `lca_misconception` | code → nearest mastered ancestor |
+| `phi_signals` | `dict[str, dict]` | `chat_to_signal` | question_id → {phi, reason, gap_tag, target_node} |
+| `session_context` | `list[dict]` | `chat_to_signal` | Accumulated chat messages with φ |
+| `pivot_node` | `str \| None` | `exercise_chat` | Safety-net node identifier |
+| `pivot_instruction` | `str` | `exercise_chat` | Bridge text for recursive pivot |
+| `time_per_question` | `dict[str, float]` | `score_answers` | question_id → time_ms |
+| `questions` | `list[dict]` | Phase A | IRT-selected questions |
+| `submitted_answers` | `list[dict]` | API | Student's submitted answers |
+| `results` | `list[dict]` | `score_answers`+others | Per-answer enriched outcomes |
+| `score` | `float` | `score_answers` | Fraction correct 0–1 |
+| `misconceptions` | `list[dict]` | `detect_misconceptions` | LLM-detected root misconceptions |
+| `misconception_weights` | `dict[str, float]` | `detect_misconceptions` | Standard code → mastery penalty |
+| `mastery_updates` | `dict[str, float]` | `update_bkt` | node_id → p_mastery after φ-BKT |
+| `mastery_verdicts` | `dict[str, dict]` | `judge_mastery` | code → {verdict, confidence, next_action, ...} |
+| `llm_decisions` | `dict[str, Any]` | `llm_recommendation_decider` | session_narrative, focus_concept, ... |
+| `knowledge_state` | `dict[str, float]` | `identify_and_rank_gaps` | node_id → KST-inferred mastery |
+| `hard_blocked_nodes` | `list[str]` | `identify_and_rank_gaps` | Nodes locked by hard prereqs |
+| `newly_blocked_nodes` | `list[str]` | `identify_and_rank_gaps` | Nodes just given TEMPORARY_BLOCK |
+| `gaps` | `list[dict]` | `identify_and_rank_gaps` | Ranked knowledge gaps |
+| `remediation_plan` | `list[dict]` | `generate_remediation` | 3 exercises per gap + nanopoint_tag |
+| `recommendations` | `list[dict]` | `generate_recommendations` | ZPD learning path |
+| `exercise_memory` | `dict[str, list]` | `load_exercise_memory` | code → prior exercise history |
 
-| Node Label | Count | Purpose |
+---
+
+## Neo4j Graph Schema
+
+### Node Labels
+
+| Label | Count | Purpose |
 |---|---|---|
 | `StandardsFrameworkItem` | 144,733 | Every curriculum standard (CCSS, TEKS, CA, FL, NY, GA, NC, OH, Multi-State) |
-| `LearningComponent` | 3,805 | Cluster/domain nodes that group standards |
-| `GeneratedQuestion` | 30 | Questions generated and persisted by the system |
+| `LearningComponent` | 3,805 | Cluster/domain grouping nodes |
+| `GeneratedQuestion` | growing | Questions generated + persisted by the system |
 | `Student` | 1+ | One node per student ID |
-| `RaschSession` | 4 | Persistent IRT session snapshots per student |
-| `Concept` | 0 | Reserved for future concept graph expansion |
-| `Chunk` | 0 | Reserved for RAG document chunking |
+| `RaschSession` | growing | IRT session snapshots |
 
----
+### Relationship Types
 
-### `StandardsFrameworkItem` Node Properties
-
-| Property | Type | Example |
-|---|---|---|
-| `identifier` | string | `"ccss-math-1-nbt-b-3"` |
-| `statementCode` | string | `"1.NBT.B.3"` |
-| `description` | string | `"Compare two two-digit numbers…"` |
-| `gradeLevelList` | list\<string\> | `["1"]` |
-| `gradeLevel` | string | `"1"` (singular, legacy field) |
-| `academicSubject` | string | `"Mathematics"` or `"English Language Arts"` |
-| `jurisdiction` | string | `"Multi-State"`, `"Texas"`, `"California"` … |
-| `normalizedStatementType` | string | `"Standard"`, `"Cluster"`, `"Domain"` |
-| `statementType` | string | Raw type from source data |
-| `provider` | string | Source organisation |
-| `author` | string | Authoring body |
-| `dateModified` | string | ISO date |
-| `inLanguage` | string | `"en"` |
-| `license` | string | License URL |
-
----
-
-### `Student` Node Properties
-
-| Property | Purpose |
-|---|---|
-| `id` | Application-level student identifier e.g. `"student_001"` |
-
----
-
-### `RaschSession` Node Properties
-
-| Property | Purpose |
-|---|---|
-| `session_id` | UUID of the session |
-| `student_id` | Links to Student.id |
-| `theta` | Final Rasch ability logit after session |
-| `q_count` | Number of questions answered |
-| `grade` | Grade level of the session |
-| `status` | `"completed"` etc. |
-| `created_at` | Timestamp |
-
----
-
-### `GeneratedQuestion` Node Properties
-
-Stored when a question is persisted after generation. Linked via `TESTS_STANDARD` to the `StandardsFrameworkItem` it tests.
-
----
-
-### Relationship Types — Full Inventory
-
-#### Curriculum prerequisite edges (connect `StandardsFrameworkItem` nodes)
+#### Curriculum edges (connect `StandardsFrameworkItem` nodes)
 
 | Relationship | Count | Key Properties | Meaning |
 |---|---|---|---|
-| `BUILDS_TOWARDS` | 5,301 | `conceptual_weight`, `description`, `identifier` | A is a prerequisite concept for B. **Primary edge used by IRT selector and KST.** |
-| `DEFINES_UNDERSTANDING` | 102,368 | `conceptual_weight`, `understanding_strength`, `inferred`, `source`, `created_at` | A must be understood to understand B. Inferred by the enrichment script. **Largest edge set — used by misconception KST propagation.** |
-| `buildsTowards` | 418 | same as BUILDS_TOWARDS | camelCase duplicate from original LC import (same semantics) |
-| `hasDependency` | 158 | `identifier`, `provider` | Hard dependency from source data |
-| `HAS_CHILD` | 25,740 | — | UPPER_SNAKE_CASE re-import of `hasChild` |
-| `hasChild` | 134,528 | `identifier`, `provider` | Hierarchical: cluster/domain → standard |
-| `hasStandardAlignment` / `HAS_STANDARD_ALIGNMENT` | 8,951 / 8,949 | — | Cross-framework standard alignment |
-| `hasEducationalAlignment` | 26,870 | — | Educational alignment edges |
-| `hasPart` | 10,095 | — | Part-of relationship |
-| `relatesTo` / `RELATES_TO` | 160 / 160 | — | Generic topical relation |
-| `mutuallyExclusiveWith` | 96 | — | Standards that cannot co-occur |
-| `hasReference` | 72 | — | Citation/reference links |
+| `BUILDS_TOWARDS` | 5,301 | `conceptual_weight` (learned via EMA) | A is prerequisite for B. Primary edge for IRT, KST, LCA |
+| `DEFINES_UNDERSTANDING` | 102,368 | `conceptual_weight`, `understanding_strength` | A must be understood to understand B |
+| `PRECEDES` | varies | — | Ordering within grade level |
+| `HAS_CHILD` | 25,740 | — | Cluster/domain → standard |
 
-> **Note on duplicates:** The graph has both camelCase (`hasChild`, `buildsTowards`) and UPPER_SNAKE_CASE (`HAS_CHILD`, `BUILDS_TOWARDS`) versions of several relationship types. The camelCase ones came from the original Learning Commons import; UPPER_SNAKE_CASE were added by the enrichment scripts. The agents query `BUILDS_TOWARDS` (uppercase).
+The `conceptual_weight` on `BUILDS_TOWARDS` is continuously learned by the EMA update in `consolidate_memory`:
+```python
+# Signal = 1.0 when prereq mastery predicts target mastery; 0.2 when not
+new_weight = old_weight * 0.95 + signal * 0.05
+```
 
-#### Edge weights — what the agents actually use
-
-The agents call `coalesce(r.conceptual_weight, 0.7)` on `BUILDS_TOWARDS` and `DEFINES_UNDERSTANDING` edges. The actual property name is **`conceptual_weight`** (not `weight`).
-
-| Property | Type | Range | Meaning |
-|---|---|---|---|
-| `conceptual_weight` | float | 0.0 – 1.0 | Strength of prerequisite dependency. ≥ 0.9 = **hard block** (failing A locks B) |
-| `understanding_strength` | float | 0.0 – 1.0 | On `DEFINES_UNDERSTANDING` — how strongly A explains B |
-| `inferred` | bool | — | `true` if created by enrichment script, `false` if from source data |
-
-#### Student mastery edges
+#### Student-specific edges
 
 | Relationship | Connects | Properties |
 |---|---|---|
-| `SKILL_STATE` | `Student` → `StandardsFrameworkItem` | `p_mastery` (float 0–1), `attempts` (int), `correct` (int), `last_updated` (datetime) |
-
-This is the **primary source of truth for student mastery**. Written by `update_bkt` after every Phase B evaluation.
+| `SKILL_STATE` | `Student → StandardsFrameworkItem` | `p_mastery`, `p_slip`, `p_guess`, `p_transit`, `attempts`, `correct`, `last_updated`, `fidelity_factor` |
+| `TEMPORARY_BLOCK` | `Student → StandardsFrameworkItem` | `blocked_by` (node_identifier that caused block), `created_at`, `updated_at` |
+| `ATTEMPTED` | `Student → GeneratedQuestion` | `correct`, `selected_answer`, `correct_answer`, `timestamp`, `session_id` |
 
 #### Question edges
 
 | Relationship | Connects | Meaning |
 |---|---|---|
-| `TESTS_STANDARD` | `GeneratedQuestion` → `StandardsFrameworkItem` | Links a generated question to the standard it tests |
+| `TESTS` | `GeneratedQuestion → StandardsFrameworkItem` | Links question to the standard it tests |
 
 ---
 
-### Agentic Workflows on the Graph
+## PostgreSQL Schema
 
-#### Phase A — Question Selection reads from Neo4j
+### `failure_chains` — Immutable φ Audit Log
 
-```
-1. select_standards_irt
-   MATCH (n:StandardsFrameworkItem)
-   WHERE jurisdiction = $state AND academicSubject = $subject
-     AND ANY(g IN n.gradeLevelList WHERE g = $grade)
-     AND n.normalizedStatementType = 'Standard'
-   → Returns candidate nodes for IRT ranking
-
-2. select_standards_irt (edges)
-   MATCH (a)-[r:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(b)
-   RETURN coalesce(r.conceptual_weight, 0.7) AS weight
-   → Builds prerequisite map for IRT constraint (skip node if prereq failed)
-
-3. fetch_rag_context
-   MATCH (pre)-[:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(n)
-   → Prereqs injected into Gemini prompt for curriculum alignment
-
-   MATCH (q:GeneratedQuestion)-[:TESTS_STANDARD]->(n)
-   → Existing question stems to avoid repetition
-```
-
-#### Phase B — Evaluation writes to + reads from Neo4j
-
-```
-4. update_bkt
-   MERGE (s:Student {id}) -[r:SKILL_STATE]-> (n:StandardsFrameworkItem {identifier})
-   SET r.p_mastery, r.attempts, r.correct, r.last_updated
-   → Writes BKT mastery after every answer
-
-5. identify_and_rank_gaps
-   MATCH (a)-[r:PRECEDES|BUILDS_TOWARDS|HAS_CHILD]->(b)  — fetches 2-hop subgraph
-   MATCH (n)-[:PRECEDES|BUILDS_TOWARDS*1..3]->(downstream) — downstream impact count
-   → KST propagation uses this subgraph to infer mastery of untested nodes
-
-6. generate_recommendations
-   MATCH (a)-[r:PRECEDES|BUILDS_TOWARDS]->(b)
-   → Builds frontier graph for ZPD identification
-   MATCH (n:StandardsFrameworkItem {identifier})
-     RETURN n.statementCode, n.description, n.gradeLevelList, n.academicSubject
-   → Fetches node details for recommendation enrichment
-
-7. chat/context endpoint (AI Tutor)
-   MATCH (s:Student {id})-[r:SKILL_STATE]->(n:StandardsFrameworkItem)
-   ORDER BY r.last_updated DESC
-   → Live mastery profile for standalone AI Tutor grounding
-```
-
----
-
-## PostgreSQL — Full Schema
-
-PostgreSQL is the **secondary/analytics store**. Neo4j `SKILL_STATE` edges are the primary source of truth for mastery. Postgres holds the full audit trail of sessions and answers, enabling historical analytics and reporting queries that would be expensive in the graph.
-
-**Connection:** `postgresql://ale_user:ale_pass@localhost:5433/ale_db`
-
-All tables currently have 0 rows — the repositories are defined and ready but the `/generate` and `/evaluate` API routes do not yet call them. The Postgres write path is the next integration milestone.
-
----
-
-### Table: `students`
-
-One row per unique student ID seen by the system.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | UUID (PK) | Internal UUID, auto-generated |
-| `external_id` | VARCHAR(255) UNIQUE | App-level ID e.g. `"student_001"` — matches Neo4j `Student.id` |
-| `display_name` | VARCHAR(255) | Optional human-readable name |
-| `grade_level` | VARCHAR(10) | Last known grade e.g. `"K3"` |
-| `overall_ability` | FLOAT | Cached Rasch θ (default 0.3) |
-| `created_at` | TIMESTAMPTZ | Auto on insert |
-| `updated_at` | TIMESTAMPTZ | Auto on update |
-
-**Relationships:** one Student → many `assessment_sessions`, many `mastery_records`
-
----
-
-### Table: `mastery_records`
-
-One row per student × standard. The Postgres audit copy of what Neo4j `SKILL_STATE` holds.
+Every time a student's φ drops below -0.3 in a live exercise session:
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | |
-| `student_id` | UUID (FK → students) | CASCADE delete |
-| `standard_code` | VARCHAR(512) | `statementCode` e.g. `"3.NF.A.1"` |
-| `subject` | VARCHAR(100) | `"Mathematics"` / `"English Language Arts"` |
-| `grade` | VARCHAR(10) | Grade level |
-| `mastery_prob` | FLOAT | BKT P(mastered) ∈ [0, 1] |
-| `attempts` | INT | Total attempts across all sessions |
-| `correct` | INT | Total correct answers |
-| `last_assessed` | TIMESTAMPTZ | When this standard was last tested |
-| `updated_at` | TIMESTAMPTZ | Auto on update |
+| `student_id` | VARCHAR(128) | |
+| `failed_node_id` | VARCHAR(512) | Neo4j identifier of failed concept |
+| `failed_node_code` | VARCHAR(64) | Standard code e.g. "5.NBT.A.1" |
+| `root_prereq_node_id` | VARCHAR(512) | LCA result node identifier |
+| `root_prereq_code` | VARCHAR(64) | LCA result standard code |
+| `signal_source` | VARCHAR(30) | "phi_negative", "misconception", "consecutive_struggles", "silence" |
+| `hops_to_lca` | INT | Hops from failed node to safety net |
+| `recorded_at` | TIMESTAMPTZ | Auto |
 
-**Repository methods:** `upsert()`, `list_for_student()`, `get_gaps(threshold=0.7)`
+### `chat_sessions` — Tutor Working Memory
 
----
-
-### Table: `assessment_sessions`
-
-One row per completed assessment run.
+One row per student, upserted on each tutor interaction:
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID (PK) | The `assessment_id` returned by `/generate` |
-| `student_id` | UUID (FK → students) | CASCADE delete |
-| `grade` | VARCHAR(10) | e.g. `"K3"` |
-| `subject` | VARCHAR(100) | e.g. `"math"` |
-| `framework` | VARCHAR(100) | e.g. `"CCSS"`, `"TEKS"` |
-| `state_jurisdiction` | VARCHAR(50) | e.g. `"Texas"`, `"Multi-State"` |
-| `num_questions` | INT | How many questions were generated |
-| `score` | FLOAT | Fraction correct 0–1 |
-| `phase` | VARCHAR(30) | `in_progress` → `evaluated` → `remediation` → `done` |
-| `gap_analysis` | JSONB | Full gap list from `identify_and_rank_gaps` |
-| `remediation_plan` | JSONB | Full remediation plan from `generate_remediation` |
-| `started_at` | TIMESTAMPTZ | When `/generate` was called |
-| `completed_at` | TIMESTAMPTZ | When `/evaluate` finished |
+| `student_id` | VARCHAR(128) UNIQUE | |
+| `current_node_id` | VARCHAR(512) | Neo4j node currently in focus |
+| `current_node_code` | VARCHAR(64) | Standard code |
+| `pedagogical_strategy` | VARCHAR(20) | "socratic" → "visual" → "cra" (escalates on struggles) |
+| `consecutive_struggles` | INT | Resets on success |
+| `last_message_at` | TIMESTAMPTZ | Used for silence detection (>120s) |
 
-**Repository methods:** `create_session()`, `get_session()`, `save_answer()`, `finalize_session()`, `list_sessions_for_student()`
+### Other tables
 
----
-
-### Table: `assessment_answers`
-
-One row per question answered within a session.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | UUID (PK) | |
-| `session_id` | UUID (FK → assessment_sessions) | CASCADE delete |
-| `question_id` | VARCHAR(64) | UUID from the generated question |
-| `question_text` | TEXT | Full question text |
-| `standard_code` | VARCHAR(512) | `statementCode` of tested standard |
-| `category` | VARCHAR(20) | `"prerequisite"` or `"target"` |
-| `dok_level` | INT | Depth of Knowledge 1–4 |
-| `student_answer` | VARCHAR(10) | `"A"`, `"B"`, `"C"`, or `"D"` |
-| `correct_answer` | VARCHAR(10) | The correct option letter |
-| `is_correct` | BOOL | Scored result |
-| `mastery_before` | FLOAT | BKT P(mastery) before this answer |
-| `mastery_after` | FLOAT | BKT P(mastery) after this answer |
-| `answered_at` | TIMESTAMPTZ | Auto on insert |
+| Table | Purpose |
+|---|---|
+| `students` | One row per student, stores external_id + cached θ |
+| `mastery_records` | Postgres audit copy of Neo4j SKILL_STATE |
+| `assessment_sessions` | One row per completed assessment run, stores gap_analysis JSONB |
+| `assessment_answers` | One row per answered question, stores mastery_before/after |
 
 ---
 
-### PostgreSQL Entity Relationship Diagram
-
-```
-students (1)
-  ├──< assessment_sessions (many)
-  │       └──< assessment_answers (many)
-  └──< mastery_records (many)
-```
-
----
-
-### Dual-Database Design Pattern
-
-```
-                    ┌─────────────────────────────┐
-                    │         Neo4j (primary)      │
-                    │                              │
-  Phase A ─────────►│  StandardsFrameworkItem       │
-  (read)            │  BUILDS_TOWARDS / DEFINES_   │
-                    │  UNDERSTANDING edges          │
-                    │  GeneratedQuestion nodes      │
-                    │                              │
-  Phase B ─────────►│  SKILL_STATE edges            │◄── source of truth
-  (read+write)      │  (p_mastery, attempts,        │    for live mastery
-                    │   correct, last_updated)      │
-                    └─────────────────────────────┘
-                              │ mirror
-                              ▼
-                    ┌─────────────────────────────┐
-                    │      PostgreSQL (secondary)  │
-                    │                              │
-                    │  students                    │
-                    │  mastery_records  ◄── audit  │
-                    │  assessment_sessions          │
-                    │  assessment_answers           │
-                    └─────────────────────────────┘
-                          used for: analytics,
-                          history, reporting,
-                          audit trail, JSONB queries
-```
-
----
-
-## API Endpoints
+## API Endpoints — Complete Reference
 
 ### Assessment (`/api/v1/assessment/`)
+
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/generate` | IRT-ranked standards → Gemini questions (Phase A) |
-| `POST` | `/evaluate` | Score + Rasch + BKT + KST + remediation (Phase B) |
-| `GET` | `/nodes` | Preview which standards would be selected (dry run) |
-| `GET` | `/grades` | List all grades, subjects, US states + frameworks |
-| `GET` | `/student/{id}/performance` | BKT performance report (coverage%, mastery%, blocking gaps) |
-| `GET` | `/student/{id}/trajectory` | K1–K8 grade-by-grade mastery trajectory |
-| `GET` | `/recommendations/{id}` | Graph-aware recommendations (immediate actions + next standards + learning path) |
+| `POST` | `/generate` | Phase A: IRT-ranked standards → Gemini questions |
+| `POST` | `/evaluate` | Phase B: full 20-node pipeline |
+| `POST` | `/exercise_complete` | Live exercise submission: φ-BKT update + EMA edge weight + unblock check |
+| `POST` | `/exercise_chat` | Live chat → φ computation → recursive pivot if needed |
+| `GET` | `/nodes` | Dry-run: preview which standards would be selected |
+| `GET` | `/grades` | List all grades, subjects, US states |
+| `GET` | `/student/{id}/performance` | BKT performance report |
+| `GET` | `/student/{id}/trajectory` | K1–K8 grade trajectory |
+| `GET` | `/readiness/{id}` | LLM assessment readiness check |
 
 ### AI Tutor (`/api/v1/chat/`)
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/tutor` | Multi-turn chat grounded in full assessment EvalResult (Gemini 2.5 Pro) |
-| `POST` | `/standalone` | Multi-turn chat grounded in live Neo4j mastery (works without assessment) |
-| `GET` | `/context/{student_id}` | Load structured mastery profile from Neo4j for standalone tutor |
 
-### Other
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/students/{id}` | Student mastery profile |
-| `POST` | `/api/v1/rag/context` | GraphRAG context for a set of node IDs |
-| `GET` | `/health` | Neo4j connectivity + standards count + Gemini status |
+| `POST` | `/tutor` | Multi-turn chat grounded in full EvalResult (Gemini 2.5 Pro) |
+| `POST` | `/standalone` | Multi-turn chat grounded in live Neo4j mastery |
+| `GET` | `/context/{student_id}` | Load structured mastery profile for standalone tutor |
 
 ---
 
-## `/evaluate` Response Shape
+## `/evaluate` Request + Response Shape
+
+### Request additions (new fields)
 
 ```json
 {
   "assessment_id": "...",
   "student_id": "...",
-  "score": 0.750,
-  "correct": 9,
-  "total": 12,
-  "grade_status": "at",          // "above" | "at" | "approaching" | "below"
-  "prerequisite_score": 0.833,
-  "target_score": 0.714,
-  "theta": 0.412,                // Rasch ability logit
-  "theta_history": [0.0, 0.3, 0.5, ...],
-  "gap_count": 3,
+  "grade": "K5",
+  "subject": "math",
+  "state": "Multi-State",
+  "total_answered_prior": 0,
+  "confusion_signal": false,
+  "confusion_chat": "",
+  "answers": [
+    {
+      "question_id": "...",
+      "question": "...",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "correct_answer": "B",
+      "student_answer": "B",
+      "time_ms": 8200,
+      "chat_message": "I think it's B because...",
+      "category": "target",
+      "dok_level": 2,
+      "standard_code": "5.NBT.A.1",
+      "node_ref": "2e68b6d0-...",
+      "beta": 0.0
+    }
+  ]
+}
+```
+
+### Response (complete shape)
+
+```json
+{
+  "assessment_id": "...",
+  "student_id": "...",
+  "score": 0.500,
+  "correct": 5,
+  "total": 10,
+  "grade_status": "below",
+  "prerequisite_score": 0.667,
+  "target_score": 0.429,
+
+  "theta": -1.842,
+  "theta_history": [0.0, -0.5, -0.8, ...],
+  "se": 0.412,
+  "total_answered": 10,
+
+  "needs_more_questions": false,
+  "additional_questions": [],
+
+  "gap_count": 5,
   "gaps": [{
     "node_identifier": "...",
-    "code": "3.NF.A.1",
+    "code": "5.NBT.A.1",
     "description": "...",
-    "mastery_prob": 0.21,
-    "hard_blocked": false,
-    "downstream_blocked": 4,
-    "priority": "medium"
+    "grade": "5",
+    "mastery_prob": 0.12,
+    "hard_blocked": true,
+    "downstream_blocked": 8,
+    "priority": "high"
   }],
-  "hard_blocked_count": 1,
+  "hard_blocked_count": 2,
+  "newly_blocked_nodes": ["...", "..."],
+
   "gap_exercises": [{
+    "node_identifier": "...",
     "standard_code": "...",
+    "nanopoint_tag": "[NanoPoint_ID: ... | Standard: ... | Difficulty: 0.12 | DOK: 1]",
     "concept_explanation": "...",
     "misconception": "...",
     "exercises": [{"order": 1, "type": "word_problem", "question": "...", "hint": "...", "answer": "..."}]
   }],
+
   "misconceptions": [{
     "question_id": "...",
     "standard_code": "...",
-    "misconception": "Student confuses numerator and denominator",
-    "affected_standards": ["3.NF.A.1"],
-    "mastery_penalty": 0.2
+    "misconception": "...",
+    "root_prerequisite_code": "4.NBT.A.1",
+    "affected_standards": ["5.NBT.A.1"],
+    "mastery_penalty": 0.25
   }],
+
   "recommendations": [{
     "rank": 1,
+    "node_identifier": "...",
     "standard_code": "...",
     "description": "...",
+    "grade": "4",
+    "difficulty_beta": -0.5,
+    "success_prob": 0.52,
+    "current_mastery": 0.18,
     "why_now": "...",
     "how_to_start": "...",
     "estimated_minutes": 30,
     "difficulty": "accessible",
-    "success_prob": 0.52,
-    "information_score": 0.2499
+    "information_score": 0.2499,
+    "llm_action": "remediate",
+    "decision_reasoning": "...",
+    "llm_priority": "high"
   }],
-  "bkt_updates": [{"node": "...", "mastery": 0.61}],
-  "results": [/* per-question detail */]
+
+  "bkt_updates": [{"node": "...", "mastery": 0.166}],
+  "mastery_verdicts": {
+    "5.NBT.A.1": {
+      "verdict": "struggling",
+      "confidence": 0.9,
+      "reasoning": "...",
+      "next_action": "remediate",
+      "override_mastery": null
+    }
+  },
+  "session_narrative": "...",
+  "focus_concept": "5.NBT.A.1",
+  "lca_safety_nets": {
+    "5.NBT.A.1": {"node_id": "...", "code": "4.NBT.A.1", "description": "...", "hops": 2, "p_mastery": 0.97}
+  },
+  "results": [{
+    "question_id": "...",
+    "question": "...",
+    "options": ["A. ...", ...],
+    "correct_answer": "B",
+    "student_answer": "A",
+    "is_correct": false,
+    "is_likely_guess": false,
+    "time_ms": 8200.0,
+    "chat_message": "I think it's A",
+    "category": "target",
+    "dok_level": 2,
+    "standard_code": "5.NBT.A.1",
+    "node_ref": "...",
+    "beta": 0.0,
+    "theta_before": 0.0,
+    "theta_after": -0.5,
+    "mastery_before": 0.72,
+    "mastery_after": 0.166,
+    "phi": -0.5
+  }]
 }
 ```
 
 ---
 
-## Settings Knobs (`.env`)
+## Project Structure (current)
 
-| Key | Default | Effect |
-|---|---|---|
-| `GEMINI_API_KEY` | `""` | API key auth for Gemini (fallback path 3) |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Model used for question generation + misconceptions |
-| `GCP_PROJECT_ID` | `homeschoollms` | Vertex AI project (ADC auth, paths 1+2) |
-| `GCP_REGION` | `us-central1` | Vertex AI region |
-| `AGENT_MAX_QUESTIONS` | `10` | Max standards/questions per assessment (latency control) |
-| `AGENT_MASTERY_THRESHOLD` | `0.7` | BKT mastery threshold |
-| `AGENT_GAP_LIMIT` | `5` | Max gaps to remediate per session |
-| `RAG_ENABLED` | `true` | Enable GraphRAG context injection |
-| `RAG_GRAPH_HOP_DEPTH` | `4` | Max prerequisite hops in RAG context |
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection |
-| `DATABASE_URL` | `postgresql+asyncpg://…` | Postgres connection |
-| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins |
-
----
-
-## Θ Bootstrapping — `_load_student_theta`
-
-Before every Phase A or Phase B call, the API loads the student's current θ from Neo4j:
-
-```python
-masteries = [r.p_mastery for r in SKILL_STATE edges]
-mean_p = avg(masteries), clamped to [0.01, 0.99]
-theta  = log(mean_p / (1 - mean_p))   # logit transform
-theta  = clamp(theta, -4.0, 4.0)
-# New students → return 0.0 (average ability)
 ```
-
-This means returning students start each assessment from their true estimated ability, not zero.
-
----
-
-## AI Tutor — Tutoring Guidelines (built into every system prompt)
-
-The tutor system prompt enforces these rules on every response:
-1. Be warm, encouraging, and specific — always reference exact standard code and concept.
-2. Use age-appropriate language for the student's grade level.
-3. When explaining a gap, say WHY the concept matters + give a real-world example.
-4. When explaining a misconception, gently clarify what the student likely misunderstood.
-5. When giving next steps, suggest 1–2 concrete practice activities.
-6. Keep responses focused — avoid unnecessary filler.
-7. May use **bold**, bullet points, and numbered lists for clarity.
-8. If asked a math/ELA question directly, work through it step-by-step.
-9. Stay grounded in this student's actual results — no generic advice.
-10. If the student seems discouraged, acknowledge effort and reframe mistakes as learning.
+adaptive-learning-engine/
+├── backend/
+│   └── app/
+│       ├── agent/
+│       │   └── state.py               ← AssessmentState Pydantic model (all pipeline fields)
+│       ├── agents/
+│       │   ├── orchestrator.py        ← Phase A (4 nodes) + Phase B (20 nodes) LangGraph graphs
+│       │   ├── assessment_agent.py    ← select_standards_irt, fetch_rag_context, generate_questions
+│       │   ├── evaluation_agent.py    ← score_answers (+ time/chat capture), update_rasch (+ SE),
+│       │   │                              detect_misconceptions, update_bkt (φ-formula)
+│       │   ├── signal_bridge.py       ← chat_to_signal, compute_pivot, write_failure_chain
+│       │   ├── adaptive_agents.py     ← detect_confusion_signal, lca_safety_net,
+│       │   │                              check_stopping_criterion, generate_follow_up_questions
+│       │   ├── gap_agent.py           ← identify_and_rank_gaps (+ TEMPORARY_BLOCK pruning)
+│       │   ├── remediation_agent.py   ← generate_remediation (+ NanoPoint metadata tags)
+│       │   ├── metacognitive_agent.py ← judge_mastery, apply_fidelity_correction,
+│       │   │                              llm_recommendation_decider
+│       │   ├── recommendation_agent.py ← generate_recommendations (ZPD frontier)
+│       │   ├── memory_agent.py        ← consolidate_memory (+ EMA), load_exercise_memory
+│       │   ├── lca_agent.py           ← find_lca (BFS backward to nearest mastered ancestor)
+│       │   ├── rasch.py               ← Rasch 1PL IRT math + RaschSession (with SE property)
+│       │   ├── kst.py                 ← KST propagation + identify_frontier
+│       │   ├── irt_selector.py        ← rank_nodes_by_information, select_next_node
+│       │   └── vertex_llm.py          ← VertexLLM: generate, generate_json, chat
+│       ├── api/routes/
+│       │   ├── assessment.py          ← /generate, /evaluate, /exercise_complete, /exercise_chat
+│       │   └── chat.py                ← /tutor, /standalone, /context
+│       ├── student/
+│       │   ├── bkt_fitter.py          ← Baum-Welch EM for per-skill BKT parameter fitting
+│       │   ├── bayesian_tracker.py    ← BayesianSkillTracker (legacy, used by rasch route)
+│       │   └── rasch_engine.py        ← RaschEngine (legacy, used by /rasch route)
+│       ├── db/
+│       │   ├── base.py                ← SQLAlchemy engine + Base
+│       │   └── models/
+│       │       ├── __init__.py        ← exports all models
+│       │       ├── student.py         ← Student, MasteryRecord, AssessmentSession, AssessmentAnswer
+│       │       └── chat.py            ← ChatSession, FailureChain
+│       ├── core/settings.py           ← all config from .env
+│       └── main.py                    ← FastAPI app, lifespan, router registration
+├── frontend/
+│   └── app/
+│       ├── assessment/page.tsx        ← main assessment UI + AI Tutor chat
+│       ├── dashboard/                 ← parent/teacher dashboard
+│       └── rasch/                     ← IRT diagnostic view
+├── infra/
+│   └── compose.yaml                   ← Neo4j + PostgreSQL Docker containers
+├── scripts/
+│   ├── import_learning_commons.py
+│   └── enrich_prerequisite_edges.py
+└── tests/
+    ├── backend/tests/test_assessment_pipeline.py   ← 88 unit tests
+    └── frontend/__tests__/assessment_logic.test.ts  ← 72 Jest tests
+```
 
 ---
 
 ## Restart Checklist
 
 ```bash
-# 1. Start Docker Desktop (Neo4j + Postgres)
-docker compose -f infra/compose.yaml down
+# 1. Docker (Neo4j + Postgres)
 docker compose -f infra/compose.yaml up -d
 
-# 2. Start backend (Poetry venv)
-/Users/esendashnyam/Library/Caches/pypoetry/virtualenvs/adaptive-learning-engine-tZmjiD0W-py3.14/bin/uvicorn \
-  backend.app.main:app --reload --host 0.0.0.0 --port 8000
+# 2. Backend (Poetry venv)
+poetry run uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
 
-# 3. Start frontend
+# 3. Frontend
 cd frontend && npm run dev
 
 # 4. Health check
@@ -889,50 +902,18 @@ curl http://localhost:8000/health
 
 ---
 
-## Project Structure
+## Environment Variables
 
-```
-adaptive-learning-engine/
-├── backend/
-│   └── app/
-│       ├── agent/              ← legacy (dormant, keep for reference)
-│       │   ├── state.py        ← shared AssessmentState schema (still imported by new system)
-│       │   ├── graph.py        ← old LangGraph
-│       │   └── nodes.py        ← old node functions
-│       ├── agents/             ← active multi-agent system
-│       │   ├── orchestrator.py       — LangGraph: Phase A + Phase B graphs
-│       │   ├── assessment_agent.py   — select_standards_irt, fetch_rag_context, generate_questions
-│       │   ├── evaluation_agent.py   — score_answers, update_rasch, detect_misconceptions, update_bkt
-│       │   ├── gap_agent.py          — identify_and_rank_gaps, route_after_gaps
-│       │   ├── remediation_agent.py  — generate_remediation (3 exercises per gap)
-│       │   ├── recommendation_agent.py — generate_recommendations (ZPD frontier)
-│       │   ├── rasch.py              — Rasch 1PL IRT math + RaschSession
-│       │   ├── kst.py                — KST propagation + identify_frontier
-│       │   ├── irt_selector.py       — rank_nodes_by_information, assign_difficulties
-│       │   └── vertex_llm.py         — VertexLLM: generate, generate_json, chat
-│       ├── api/routes/
-│       │   ├── assessment.py   ← main assessment endpoints
-│       │   ├── chat.py         ← AI Tutor: /tutor, /standalone, /context
-│       │   ├── students.py
-│       │   ├── rag.py
-│       │   ├── agent.py
-│       │   └── rasch.py
-│       ├── core/settings.py    ← all config from .env
-│       ├── db/                 ← Postgres models + async engine
-│       ├── student/            ← legacy AssessmentEngine + BayesianSkillTracker
-│       └── main.py             ← FastAPI app + lifespan + router registration
-├── frontend/
-│   └── app/
-│       ├── assessment/page.tsx ← main assessment UI + AI Tutor chat
-│       ├── dashboard/          ← student mastery dashboard
-│       └── rasch/              ← IRT diagnostic page
-├── infra/
-│   └── compose.yaml            ← Neo4j + Postgres Docker containers
-├── scripts/
-│   ├── import_learning_commons.py      ← import standards into Neo4j
-│   └── enrich_prerequisite_edges.py
-├── data/
-│   └── learning-commons-kg/            ← exported JSONL nodes/relationships
-├── pyproject.toml
-└── .env                                ← secrets (gitignored)
-```
+| Key | Default | Effect |
+|---|---|---|
+| `GEMINI_API_KEY` | `""` | Gemini API key auth (fallback if ADC unavailable) |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Model for pipeline nodes (question gen, φ auditor, misconceptions, remediation) |
+| `GCP_PROJECT_ID` | — | Vertex AI project (ADC auth) |
+| `GCP_REGION` | `us-central1` | Vertex AI region |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection |
+| `NEO4J_USER` | `neo4j` | Neo4j auth |
+| `NEO4J_PASSWORD` | — | Neo4j auth |
+| `DATABASE_URL` | `postgresql+asyncpg://…` | Postgres async connection |
+| `AGENT_MAX_QUESTIONS` | `10` | Max questions per initial assessment batch |
+| `AGENT_MASTERY_THRESHOLD` | `0.7` | BKT mastery threshold |
+| `AGENT_GAP_LIMIT` | `5` | Max gaps to remediate per session |

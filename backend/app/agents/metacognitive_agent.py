@@ -60,7 +60,7 @@ def judge_mastery(state: AssessmentState) -> dict:
         if code not in standard_profiles:
             standard_profiles[code] = {
                 "standard_code":  code,
-                "description":    r.get("question", "")[:80],
+                "description":    (r.get("question") or "")[:80],
                 "mastery_before": r.get("mastery_before", 0.0),
                 "mastery_after":  r.get("mastery_after", 0.0),
                 "current_session": [],
@@ -211,7 +211,7 @@ def llm_recommendation_decider(state: AssessmentState) -> dict:
             hist_str = f", prior={past_correct}/{len(history)} correct"
 
         rec_lines.append(
-            f"  Rank {r.get('rank',0)}: {code} — {r.get('description','')[:70]}\n"
+            f"  Rank {r.get('rank',0)}: {code} — {(r.get('description') or '')[:70]}\n"
             f"    Success prob: {r.get('success_prob', 0.5):.0%} | "
             f"Mastery: {r.get('current_mastery', 0.3):.2f} | "
             f"LLM verdict: {verdict.get('verdict', 'unknown')} "
@@ -303,3 +303,128 @@ Return a JSON object:
         logger.warning(f"llm_recommendation_decider failed (non-fatal): {exc}")
 
     return {"llm_decisions": llm_decisions}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node 3 — apply_fidelity_correction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_fidelity_correction(state: AssessmentState) -> dict:
+    """
+    Neuro-Symbolic Fidelity Multiplier — adjusts BKT P(L) based on two signals:
+
+      1. Time-based: correct answer in < 4 s on a non-trivial question
+         → likely a guess; halve the P(L) gain recorded by update_bkt.
+
+      2. LLM-based: judge_mastery returns next_action="challenge" for a concept
+         the student answered correctly → genuine mastery; apply a small bonus (1.2×).
+         If judge_mastery verdict = "struggling" despite a correct answer → likely guess.
+
+    The correction is written back to Neo4j on the SKILL_STATE edge.
+    """
+    logger.info("━" * 60)
+    logger.info("  PHASE B │ apply_fidelity_correction  (Neuro-Symbolic fidelity pass)")
+    logger.info("━" * 60)
+
+    from backend.app.core.settings import settings
+    from neo4j import GraphDatabase
+
+    verdicts      = state.mastery_verdicts      # std_code → {verdict, next_action, ...}
+    time_map      = state.time_per_question      # question_id → time_ms
+
+    # Build a per-node correction factor
+    # We work at the result level so we can map node_ref → correction
+    corrections: dict[str, float] = {}   # node_identifier → factor
+
+    for r in state.results:
+        if not r.get("is_correct"):
+            continue   # only correct answers can be over-credited
+
+        nid       = r.get("node_ref", "")
+        qid       = r.get("question_id", "")
+        std_code  = r.get("standard_code", "")
+        time_ms   = time_map.get(qid, 0.0)
+        verdict   = verdicts.get(std_code, {})
+
+        # Default: no correction
+        factor = 1.0
+
+        # Signal 1 — speed flag (already set by score_answers)
+        if r.get("is_likely_guess"):
+            factor = min(factor, 0.5)   # cap gain at half
+
+        # Signal 2 — LLM verdict override
+        llm_verdict    = verdict.get("verdict", "")
+        llm_action     = verdict.get("next_action", "")
+        override       = verdict.get("override_mastery")
+
+        if llm_verdict == "struggling" and r.get("is_correct"):
+            # LLM thinks the student is struggling despite this correct answer → likely a fluke
+            factor = min(factor, 0.5)
+        elif llm_action == "challenge" and llm_verdict == "mastered":
+            # LLM is confident of genuine mastery → small bonus multiplier
+            factor = max(factor, 1.2)
+
+        if nid and factor != 1.0:
+            corrections[nid] = min(corrections.get(nid, factor), factor)
+
+    if not corrections:
+        logger.info("Fidelity correction: no adjustments needed")
+        return {}
+
+    # Apply corrections to Neo4j SKILL_STATE edges
+    driver = GraphDatabase.driver(
+        settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+    )
+    adjusted = 0
+    try:
+        with driver.session() as neo:
+            for nid, factor in corrections.items():
+                # Read current mastery and the mastery before this session
+                # We adjust only the GAIN (mastery_after - mastery_before), not the total
+                row = neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->(n:StandardsFrameworkItem {identifier: $nid})
+                    RETURN r.p_mastery AS p_mastery
+                    """,
+                    sid=state.student_id, nid=nid,
+                ).single()
+                if not row:
+                    continue
+
+                p_current = float(row["p_mastery"])
+                # Find the pre-BKT mastery from results
+                p_before = next(
+                    (r.get("mastery_before", p_current) for r in state.results
+                     if r.get("node_ref") == nid),
+                    p_current,
+                )
+
+                gain = p_current - p_before
+                if gain <= 0:
+                    continue   # no positive gain to correct
+
+                corrected = p_before + gain * factor
+                corrected = max(0.05, min(0.999, corrected))
+
+                neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->(n:StandardsFrameworkItem {identifier: $nid})
+                    SET r.p_mastery = $pm, r.fidelity_factor = $ff, r.last_updated = $now
+                    """,
+                    sid=state.student_id, nid=nid,
+                    pm=round(corrected, 4), ff=round(factor, 3),
+                    now=__import__("datetime").datetime.utcnow().isoformat(),
+                )
+                adjusted += 1
+                logger.info(
+                    f"Fidelity [{nid}]: factor={factor:.2f}  "
+                    f"p_mastery {p_before:.3f}+{gain:.3f} → {corrected:.3f}"
+                )
+    except Exception as exc:
+        logger.warning(f"apply_fidelity_correction failed (non-fatal): {exc}")
+    finally:
+        driver.close()
+
+    logger.info(f"Fidelity correction: adjusted {adjusted}/{len(corrections)} nodes")
+    return {}

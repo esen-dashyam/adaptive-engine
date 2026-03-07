@@ -43,6 +43,11 @@ class AnswerSubmission(BaseModel):
     grade: str = Field(default="K5")
     subject: str = Field(default="math")
     state: str = Field(default="Multi-State")
+    # Elastic Stopping: cumulative count from prior batches (0 on first call)
+    total_answered_prior: int = Field(default=0)
+    # Confusion signal: student typed "I don't get this" without finishing
+    confusion_signal: bool = Field(default=False)
+    confusion_chat: str = Field(default="")
     answers: list[dict[str, Any]] = Field(
         ...,
         description=(
@@ -66,6 +71,25 @@ class ExerciseResultRequest(BaseModel):
     question_type: str = "practice"
     difficulty_beta: float = 0.0
     session_id: str | None = None
+
+
+class ExerciseChatRequest(BaseModel):
+    """
+    Live chat message sent by the student DURING a remediation exercise.
+    The backend computes φ, triggers recursive pivot if φ < -0.3,
+    and returns a bridge instruction + optional pivot exercise.
+    """
+    student_id: str
+    node_identifier: str        # Neo4j identifier of the current exercise's target standard
+    standard_code: str = ""
+    concept: str = ""           # human-readable concept name, e.g. "regrouping"
+    exercise_text: str = ""     # full text of the exercise shown to the student
+    nanopoint_tag: str = ""     # [NanoPoint_ID: ... | Standard: ... | ...] from remediation plan
+    chat_message: str           # what the student typed
+    answer: str = ""            # student's current answer (may be empty if mid-exercise)
+    correct: bool | None = None # None if not yet graded
+    time_ms: float = 0.0
+    beta: float = 0.0           # question difficulty logit
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -257,6 +281,9 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
             questions=questions,
             submitted_answers=submitted,
             phase="evaluate",
+            total_answered=body.total_answered_prior,
+            confusion_signal=body.confusion_signal,
+            confusion_chat=body.confusion_chat,
         )
 
         loop    = asyncio.get_event_loop()
@@ -309,6 +336,15 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
             "focus_concept":     getattr(final, "llm_decisions", {}).get("focus_concept", ""),
             # Full results
             "results":           final.results,
+            # Elastic Stopping — if True, frontend shows additional_questions next
+            "needs_more_questions": final.needs_more_questions,
+            "additional_questions": final.additional_questions,
+            "total_answered":       final.total_answered,
+            "se":                   round(final.se, 3),
+            # Confusion / LCA outputs
+            "lca_safety_nets":      final.lca_safety_nets,
+            # Cognitive Load Pruning
+            "newly_blocked_nodes":  final.newly_blocked_nodes,
         }
     except Exception as exc:
         import traceback
@@ -491,6 +527,32 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
                 }
 
         result = await loop.run_in_executor(None, _run_update)
+
+        # ── Unblock downstream nodes when blocker is mastered ──────────────
+        # If this exercise brought the blocking node above the mastery threshold,
+        # clear TEMPORARY_BLOCK relationships for all nodes it was blocking.
+        MASTERY_UNBLOCK_THRESHOLD = 0.65
+        if result["p_mastery_after"] >= MASTERY_UNBLOCK_THRESHOLD:
+            def _clear_blocks():
+                with driver.session() as neo:
+                    cleared = neo.run(
+                        """
+                        MATCH (s:Student {id: $sid})-[b:TEMPORARY_BLOCK]->(n)
+                        WHERE b.blocked_by = $nid
+                        DELETE b
+                        RETURN count(b) AS cleared
+                        """,
+                        sid=body.student_id, nid=body.node_identifier,
+                    ).single()
+                    return int(cleared["cleared"]) if cleared else 0
+
+            n_cleared = await loop.run_in_executor(None, _clear_blocks)
+            if n_cleared:
+                logger.info(
+                    f"Unblocked {n_cleared} downstream nodes — "
+                    f"student {body.student_id} mastered [{body.node_identifier}]"
+                )
+
         driver.close()
 
         logger.info(
@@ -508,6 +570,159 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
 
     except Exception as exc:
         logger.error(f"exercise_complete failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Exercise Chat — Neuro-Symbolic Signal Bridge
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/exercise_chat", summary="Process live student chat → φ signal + recursive pivot")
+async def exercise_chat(body: ExerciseChatRequest) -> dict[str, Any]:
+    """
+    The 'Back and Forth' engine.
+
+    Called when a student types anything into the chatbox during a remediation
+    exercise.  The backend:
+      1. Calls the Dynamic Weight Auditor (Gemini) to compute φ from the chat.
+      2. Applies φ-modified BKT update to Neo4j.
+      3. If φ < -0.3 (Hard Block): runs LCA to find the safety-net node,
+         generates a bridge instruction, and returns a simpler pivot exercise.
+      4. Writes a FailureChain audit record to PostgreSQL.
+      5. Returns: {phi, reason, pivot_needed, pivot_node, bridge_instruction}.
+
+    The frontend uses this to:
+      - The "Back": show the bridge instruction + pivot exercise.
+      - The "Forth": once the pivot is solved (φ → 1.0), resume original exercise
+        with the bridge framing.
+    """
+    from backend.app.agents.signal_bridge import (
+        PHI_BACKPROP_THRESHOLD,
+        _heuristic_phi,
+        compute_pivot,
+        write_failure_chain,
+    )
+    from backend.app.agents.vertex_llm import get_llm
+    from backend.app.agents.evaluation_agent import _bkt_update, _neo4j, _get_student_mastery_and_params, _upsert_mastery
+    from backend.app.student.bkt_fitter import DEFAULT_P_TRANSIT
+
+    try:
+        # ── 1. Compute φ via Gemini ────────────────────────────────────────────
+        llm = get_llm()
+        phi_prompt = f"""\
+Role: You are the Dynamic Weight Auditor for a K-8 adaptive math tutor.
+
+Exercise context:
+  {body.nanopoint_tag or f"[Standard: {body.standard_code} | Difficulty: {body.beta:.1f}]"}
+  Exercise: {body.exercise_text[:300]}
+  Concept: {body.concept}
+
+Student signal:
+  chat_message: "{body.chat_message}"
+  answer_so_far: "{body.answer}"
+  correct: {body.correct}
+  time_ms: {body.time_ms:.0f}
+
+Determine the Fidelity Signal φ ∈ [-1.0, 1.0]:
+  1.0  Fluent      — student shows genuine conceptual understanding
+  0.5  Partial     — student is trying but has a specific hurdle
+  0.2  Brittle     — likely guessing or pattern-matching
+ -0.5  Struggling  — specific prerequisite hurdle identified
+ -1.0  Hard Block  — "I don't get this" — fundamental prerequisite missing
+
+Return JSON: {{"phi": <float>, "reason": "<1 sentence>", "gap_tag": "<sub-skill or null>"}}"""
+
+        phi = None
+        reason = ""
+        gap_tag = None
+        try:
+            raw = llm.generate_json(phi_prompt)
+            if isinstance(raw, dict):
+                phi     = max(-1.0, min(1.0, float(raw.get("phi", 0.5))))
+                reason  = raw.get("reason", "")
+                gap_tag = raw.get("gap_tag")
+        except Exception as exc:
+            logger.warning(f"exercise_chat φ computation failed: {exc}")
+
+        if phi is None:
+            mock_r = {
+                "is_correct": body.correct or False,
+                "is_likely_guess": body.time_ms > 0 and body.time_ms < 3000,
+                "time_ms": body.time_ms,
+                "dok_level": 2,
+            }
+            phi = _heuristic_phi(mock_r)["phi"]
+            reason = "Heuristic φ (LLM unavailable)"
+
+        logger.info(
+            f"exercise_chat: student={body.student_id} std={body.standard_code} "
+            f"φ={phi:+.2f}  reason='{reason[:60]}'"
+        )
+
+        # ── 2. φ-modified BKT update ──────────────────────────────────────────
+        loop   = asyncio.get_event_loop()
+        driver = _neo4j()
+
+        def _do_bkt():
+            with driver.session() as neo:
+                p_before, p_slip, p_guess, p_transit = _get_student_mastery_and_params(
+                    neo, body.student_id, body.node_identifier
+                )
+                count_row = neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->
+                          (n:StandardsFrameworkItem {identifier: $nid})
+                    RETURN coalesce(r.attempts, 0) AS att, coalesce(r.correct, 0) AS cor
+                    """,
+                    sid=body.student_id, nid=body.node_identifier,
+                ).single()
+                attempts = (count_row["att"] if count_row else 0) + 1
+                correct_count = (count_row["cor"] if count_row else 0) + (1 if body.correct else 0)
+
+                p_after = _bkt_update(
+                    p_before,
+                    body.correct or False,
+                    p_slip, p_guess, p_transit,
+                    phi=phi,
+                )
+                _upsert_mastery(neo, body.student_id, body.node_identifier, p_after, attempts, correct_count)
+                return p_before, p_after
+
+        p_before, p_after = await loop.run_in_executor(None, _do_bkt)
+        driver.close()
+
+        # ── 3. Recursive Pivot if φ < threshold ───────────────────────────────
+        pivot_result = await loop.run_in_executor(
+            None,
+            lambda: compute_pivot(
+                body.student_id, body.node_identifier, body.standard_code,
+                body.concept, phi, gap_tag,
+            ),
+        )
+
+        # ── 4. Write FailureChain audit record ────────────────────────────────
+        if phi < PHI_BACKPROP_THRESHOLD:
+            await loop.run_in_executor(
+                None,
+                lambda: write_failure_chain(
+                    body.student_id, body.node_identifier, body.standard_code,
+                    pivot_result.get("pivot_node"),
+                    signal_source="phi_negative",
+                ),
+            )
+
+        return {
+            "phi":                phi,
+            "reason":             reason,
+            "gap_tag":            gap_tag,
+            "p_mastery_before":   round(p_before, 3),
+            "p_mastery_after":    round(p_after, 3),
+            **pivot_result,
+        }
+
+    except Exception as exc:
+        import traceback
+        logger.error(f"exercise_chat failed: {exc}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -891,6 +1106,55 @@ async def get_recommendations(
     except Exception as exc:
         logger.error(f"Recommendations failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/calibrate_bkt",
+    summary="Run Baum-Welch EM to fit per-skill BKT parameters from response history",
+)
+async def calibrate_bkt(
+    min_observations: int = Query(
+        default=30,
+        ge=10,
+        description="Minimum ATTEMPTED records required to fit a skill",
+    ),
+) -> dict[str, Any]:
+    """
+    Fits (p_init, p_transit, p_slip, p_guess) per StandardsFrameworkItem
+    using Baum-Welch EM on accumulated student response sequences stored in Neo4j.
+
+    Writes fitted params back to each node as:
+      n.bkt_p_init, n.bkt_p_transit, n.bkt_p_slip, n.bkt_p_guess,
+      n.bkt_fitted_at, n.bkt_n_sequences
+
+    Both BayesianSkillTracker and the evaluation pipeline read these values
+    on every subsequent assessment.  Skills with insufficient data keep system
+    defaults until more responses accumulate.
+
+    Call this endpoint periodically (e.g. nightly cron) as more student data
+    builds up.
+    """
+    from neo4j import GraphDatabase
+    from backend.app.core.settings import settings
+    from backend.app.student.bkt_fitter import calibrate_all_skills
+
+    driver = GraphDatabase.driver(
+        settings.neo4j_uri,
+        auth=(settings.neo4j_user, settings.neo4j_password),
+    )
+    try:
+        stats = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: calibrate_all_skills(driver, settings.neo4j_database, min_observations),
+        )
+    finally:
+        driver.close()
+
+    return {
+        "status": "ok",
+        "min_observations": min_observations,
+        **stats,
+    }
 
 
 @router.get(

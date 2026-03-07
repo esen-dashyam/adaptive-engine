@@ -5,18 +5,28 @@ Phase A (question generation):
   select_standards_irt → fetch_rag_context → generate_questions → END
 
 Phase B (evaluation + remediation + recommendations):
-  score_answers → update_rasch → detect_misconceptions → update_bkt
-    → consolidate_memory (persist attempts + EMA edge weight update)
-    → load_exercise_memory (fetch prior history)
-    → identify_and_rank_gaps → route_after_gaps
-        ├─ "remediate" → generate_remediation → judge_mastery → generate_recommendations
-        │                → llm_recommendation_decider → write_report
-        └─ "write_report" → judge_mastery → generate_recommendations
-                          → llm_recommendation_decider → write_report → END
 
-The two phases are compiled as separate LangGraph graphs so the API can:
-  Phase A: run → pause → return questions to UI
-  Phase B: resume with submitted answers → run to completion
+  detect_confusion_signal
+    ├─ "confused" → lca_safety_net → write_report (early exit with scaffold)
+    └─ "normal"  → score_answers → update_rasch → check_stopping_criterion
+        ├─ "more_questions" → generate_follow_up_questions → write_report (partial)
+        └─ "continue"       → detect_misconceptions → lca_safety_net → update_bkt
+               → consolidate_memory → load_exercise_memory
+               → identify_and_rank_gaps (+ bloom/prune)
+               → route_after_gaps:
+                   ├─ "remediate" → generate_remediation → judge_mastery
+                   └─ "judge"     → judge_mastery
+               → apply_fidelity_correction
+               → generate_recommendations → llm_recommendation_decider
+               → write_report → END
+
+Key additions vs previous version:
+  detect_confusion_signal     — intercept live "I don't get this" signal
+  lca_safety_net              — BFS backward to nearest mastered ancestor
+  check_stopping_criterion    — Elastic Stopping router (SE < 0.3 or count ≥ 25)
+  generate_follow_up_questions — pull another batch when θ estimate is unstable
+  apply_fidelity_correction   — Neuro-Symbolic fidelity multiplier on BKT gain
+  _prune_downstream_nodes     — TEMPORARY_BLOCK cognitive load pruning (in gap_agent)
 """
 
 from __future__ import annotations
@@ -40,9 +50,22 @@ from backend.app.agents.evaluation_agent import (
 )
 from backend.app.agents.gap_agent import identify_and_rank_gaps, route_after_gaps
 from backend.app.agents.memory_agent import consolidate_memory, load_exercise_memory
-from backend.app.agents.metacognitive_agent import judge_mastery, llm_recommendation_decider
+from backend.app.agents.metacognitive_agent import (
+    apply_fidelity_correction,
+    judge_mastery,
+    llm_recommendation_decider,
+)
 from backend.app.agents.remediation_agent import generate_remediation
 from backend.app.agents.recommendation_agent import generate_recommendations
+from backend.app.agents.adaptive_agents import (
+    check_stopping_criterion,
+    detect_confusion_signal,
+    generate_follow_up_questions,
+    lca_safety_net,
+    route_confusion,
+    route_stopping,
+)
+from backend.app.agents.signal_bridge import chat_to_signal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,51 +125,95 @@ def build_phase_a() -> StateGraph:
 
 def build_phase_b() -> StateGraph:
     """
-    Phase B: evaluate answers → Rasch + BKT update → memory consolidation →
-             KST gap analysis → remediation → LLM mastery judgment →
-             recommendations → LLM recommendation decider → write report.
+    Phase B: full adaptive evaluation pipeline.
 
-    New nodes vs original:
-      consolidate_memory          — persist exercise attempts + EMA edge weight update
-      load_exercise_memory        — fetch prior exercise history before remediation
-      judge_mastery               — LLM holistic mastery verdict per concept
-      llm_recommendation_decider  — LLM filters/reranks algorithmic recommendations
+    New nodes added in this version:
+      detect_confusion_signal     — entry; intercepts "I don't get this" live signal
+      lca_safety_net              — BFS backward to nearest mastered anchor
+      check_stopping_criterion    — Elastic Stopping pass-through (routing in route_stopping)
+      generate_follow_up_questions — pull extra questions when SE ≥ 0.3
+      apply_fidelity_correction   — Neuro-Symbolic fidelity multiplier on BKT gain
+
+    route_after_gaps now routes to "judge_mastery" (renamed from "write_report")
+    so both paths (gaps + no-gaps) still converge at judge_mastery.
     """
     g = StateGraph(AssessmentState)
 
-    g.add_node("score_answers",               score_answers)
-    g.add_node("update_rasch",                update_rasch)
-    g.add_node("detect_misconceptions",       detect_misconceptions)
-    g.add_node("update_bkt",                  update_bkt)
-    g.add_node("consolidate_memory",          consolidate_memory)
-    g.add_node("load_exercise_memory",        load_exercise_memory)
-    g.add_node("identify_and_rank_gaps",      identify_and_rank_gaps)
-    g.add_node("generate_remediation",        generate_remediation)
-    g.add_node("judge_mastery",               judge_mastery)
-    g.add_node("generate_recommendations",    generate_recommendations)
-    g.add_node("llm_recommendation_decider",  llm_recommendation_decider)
-    g.add_node("write_report",                write_report)
+    # ── All nodes ─────────────────────────────────────────────────────────────
+    g.add_node("detect_confusion_signal",      detect_confusion_signal)
+    g.add_node("lca_confusion",                lca_safety_net)   # confusion path
+    g.add_node("lca_misconception",            lca_safety_net)   # post-misconception path
+    g.add_node("score_answers",                score_answers)
+    g.add_node("chat_to_signal",               chat_to_signal)
+    g.add_node("update_rasch",                 update_rasch)
+    g.add_node("check_stopping_criterion",     check_stopping_criterion)
+    g.add_node("generate_follow_up_questions", generate_follow_up_questions)
+    g.add_node("detect_misconceptions",        detect_misconceptions)
+    g.add_node("update_bkt",                   update_bkt)
+    g.add_node("consolidate_memory",           consolidate_memory)
+    g.add_node("load_exercise_memory",         load_exercise_memory)
+    g.add_node("identify_and_rank_gaps",       identify_and_rank_gaps)
+    g.add_node("generate_remediation",         generate_remediation)
+    g.add_node("judge_mastery",                judge_mastery)
+    g.add_node("apply_fidelity_correction",    apply_fidelity_correction)
+    g.add_node("generate_recommendations",     generate_recommendations)
+    g.add_node("llm_recommendation_decider",   llm_recommendation_decider)
+    g.add_node("write_report",                 write_report)
 
-    g.set_entry_point("score_answers")
-    g.add_edge("score_answers",               "update_rasch")
-    g.add_edge("update_rasch",                "detect_misconceptions")
-    g.add_edge("detect_misconceptions",       "update_bkt")
-    g.add_edge("update_bkt",                  "consolidate_memory")
-    g.add_edge("consolidate_memory",          "load_exercise_memory")
-    g.add_edge("load_exercise_memory",        "identify_and_rank_gaps")
+    # ── Edges ─────────────────────────────────────────────────────────────────
+    g.set_entry_point("detect_confusion_signal")
+
+    # Confusion signal gate
+    g.add_conditional_edges(
+        "detect_confusion_signal",
+        route_confusion,
+        {
+            "confused": "lca_confusion",
+            "normal":   "score_answers",
+        },
+    )
+    # Confusion path → early exit with scaffold anchor info
+    g.add_edge("lca_confusion", "write_report")
+
+    # Normal path: score → φ audit → rasch → elastic stopping
+    g.add_edge("score_answers",   "chat_to_signal")
+    g.add_edge("chat_to_signal",  "update_rasch")
+    g.add_edge("update_rasch",    "check_stopping_criterion")
+
+    # Elastic stopping gate
+    g.add_conditional_edges(
+        "check_stopping_criterion",
+        route_stopping,
+        {
+            "more_questions": "generate_follow_up_questions",
+            "continue":       "detect_misconceptions",
+        },
+    )
+    # High-SE path → partial report with additional questions for frontend
+    g.add_edge("generate_follow_up_questions", "write_report")
+
+    # Full evaluation path
+    g.add_edge("detect_misconceptions", "lca_misconception")
+    g.add_edge("lca_misconception",     "update_bkt")
+    g.add_edge("update_bkt",            "consolidate_memory")
+    g.add_edge("consolidate_memory",    "load_exercise_memory")
+    g.add_edge("load_exercise_memory",  "identify_and_rank_gaps")
+
+    # Gap routing — both paths merge at judge_mastery
     g.add_conditional_edges(
         "identify_and_rank_gaps",
         route_after_gaps,
         {
-            "remediate":    "generate_remediation",
-            "write_report": "judge_mastery",
+            "remediate": "generate_remediation",
+            "judge":     "judge_mastery",
         },
     )
-    g.add_edge("generate_remediation",        "judge_mastery")
-    g.add_edge("judge_mastery",               "generate_recommendations")
-    g.add_edge("generate_recommendations",    "llm_recommendation_decider")
-    g.add_edge("llm_recommendation_decider",  "write_report")
-    g.add_edge("write_report",                END)
+    g.add_edge("generate_remediation",       "judge_mastery")
+    g.add_edge("judge_mastery",              "apply_fidelity_correction")
+    g.add_edge("apply_fidelity_correction",  "generate_recommendations")
+    g.add_edge("generate_recommendations",   "llm_recommendation_decider")
+    g.add_edge("llm_recommendation_decider", "write_report")
+    g.add_edge("write_report",               END)
 
     return g
 
@@ -156,7 +223,7 @@ def build_phase_b() -> StateGraph:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _phase_a_graph = None
-_phase_b_graph = None
+_phase_b_graph = None  # rebuilt on first request after import
 
 
 def get_phase_a():

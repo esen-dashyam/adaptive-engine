@@ -111,7 +111,15 @@ def generate_remediation(state: AssessmentState) -> dict:
                 )
             )
 
+        # Hidden metadata tag injected into the prompt so the Signal Bridge can
+        # later reference which NanoPoint and difficulty level this exercise targets.
+        nanopoint_tag = (
+            f"[NanoPoint_ID: {gap.get('node_identifier', code)} | "
+            f"Standard: {code} | Difficulty: {mastery:.2f} | DOK: {dok_target}]"
+        )
+
         prompt = f"""You are a remediation specialist creating targeted practice exercises for a {grade_label} {subject_name} student.
+{nanopoint_tag}
 
 Student ability θ = {theta:+.2f} (0 = average; negative = struggling; positive = strong)
 Gap: {code} — {description}
@@ -154,6 +162,7 @@ Return ONLY a valid JSON object:
                     "priority":           gap.get("priority", "medium"),
                     "hard_blocked":       is_hard,
                     "misconception":      misconception,
+                    "nanopoint_tag":      nanopoint_tag,
                     "concept_explanation": raw.get("concept_explanation", ""),
                     "exercises":          raw.get("exercises", []),
                 }

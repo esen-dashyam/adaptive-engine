@@ -368,6 +368,26 @@ class RaschEngine:
             )
             future_nodes = [dict(r) for r in future]
 
+            # Step 4: LOCKED — nodes far beyond the student's current ability
+            # β > θ + 1.5 → too hard to attempt; floor mastery at 0.1 and mark locked
+            locked = s.run(
+                """
+                MATCH (n:StandardsFrameworkItem)
+                WHERE n.academicSubject = 'Mathematics'
+                  AND n.normalizedStatementType = 'Standard'
+                  AND n.difficulty IS NOT NULL
+                  AND n.difficulty > $lock_threshold
+                RETURN n.identifier   AS id,
+                       n.statementCode AS code,
+                       n.description   AS description,
+                       n.difficulty    AS beta
+                LIMIT 200
+                """,
+                lock_threshold=theta_final + 1.5,
+            )
+            locked_nodes = [dict(r) for r in locked]
+            _write_locked_state(s, student_id, locked_nodes)
+
             # Write heat-map SKILL_STATEs
             _write_heat_map(s, student_id, frontier_nodes, MASTERY_FRONTIER)
             _write_heat_map(s, student_id, ancestor_nodes, MASTERY_ANCESTOR)
@@ -387,6 +407,7 @@ class RaschEngine:
             "ability_label":     _theta_label(theta_final),
             "frontier_count":    len(frontier_nodes),
             "ancestor_count":    len(ancestor_nodes),
+            "locked_count":      len(locked_nodes),
             "frontier":          frontier_nodes[:20],
             "ancestors":         ancestor_nodes[:20],
             "next_best_actions": future_nodes,
@@ -478,6 +499,48 @@ def _theta_label(theta: float) -> str:
     if theta >= 2.5: return "Grade 3–4 level"
     if theta >= 1.5: return "Grade 2–3 level"
     return "Grade 1–2 level"
+
+
+def _write_locked_state(session, student_id: str, nodes: list[dict]) -> None:
+    """
+    Mark nodes that are far beyond the student's current θ as LOCKED.
+
+    Only creates / updates the SKILL_STATE if it does not already exist OR
+    if the existing mastery is already at the floor (≤ 0.1), so that real
+    BKT progress is never overwritten by a lock.
+    """
+    if not nodes:
+        return
+
+    session.run(
+        "MERGE (st:Student {student_id: $sid}) "
+        "ON CREATE SET st.created_at = datetime()",
+        sid=student_id,
+    )
+
+    for node in nodes:
+        nid = node.get("id") or node.get("identifier")
+        if not nid:
+            continue
+        session.run(
+            """
+            MATCH (n:StandardsFrameworkItem {identifier: $nid})
+            MATCH (st:Student {student_id: $sid})
+            MERGE (st)-[sk:SKILL_STATE]->(n)
+            ON CREATE SET
+                sk.p_mastery   = 0.1,
+                sk.nano_weight = 10.0,
+                sk.attempts    = 0,
+                sk.correct     = 0,
+                sk.locked      = true,
+                sk.created_at  = datetime(),
+                sk.source      = 'rasch_locked'
+            ON MATCH SET
+                sk.locked     = CASE WHEN sk.p_mastery <= 0.1 THEN true ELSE false END,
+                sk.updated_at = datetime()
+            """,
+            sid=student_id, nid=nid,
+        )
 
 
 def _write_heat_map(

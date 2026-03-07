@@ -10,7 +10,8 @@ POST /chat/tutor
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from loguru import logger
@@ -38,6 +39,263 @@ class TutorRequest(BaseModel):
         default_factory=dict,
         description="Full EvalResult payload from /assessment/evaluate",
     )
+    latency_seconds: float = Field(
+        default=0.0,
+        description="Seconds since the student's previous message. >120 triggers silence detection.",
+    )
+
+
+class PendingAction(BaseModel):
+    """
+    A BKT update that the tutor wants to record, pending student confirmation.
+    The frontend shows a confirmation dialog before calling /chat/confirm_action.
+    """
+    action_type: Literal["record_answer"] = "record_answer"
+    student_id: str
+    standard_code: str
+    student_answer: str
+    is_correct: bool
+    confidence: float           # system's confidence that this was intentional
+    explanation: str = ""       # tutor's explanation of why it's correct/incorrect
+
+
+class ConfirmActionRequest(BaseModel):
+    action: PendingAction
+    confirmed: bool             # True = record it, False = student said it was accidental
+
+
+# ── Intent detection ─────────────────────────────────────────────────────────
+
+def _detect_intent(message: str, history: list[dict], latency_seconds: float = 0.0) -> dict:
+    """
+    Classify the student's message before deciding whether to trigger a
+    BKT update.  Uses fast heuristics first; falls back to a lightweight
+    LLM call only for ambiguous cases.
+
+    Returns:
+        {
+          "intent":               "answer_attempt" | "question" | "conversation" | "accidental",
+          "confidence":           0.0–1.0,
+          "metacognitive_signal": "positive" | "negative" | "silence" | None,
+        }
+
+    Metacognitive signals (checked independently of intent):
+      - positive: "I get it", "I understand", "that makes sense", "got it", "I see", "makes sense"
+      - negative: "I don't get it", "I'm lost", "I'm confused", "I don't understand", "no idea"
+      - silence:  latency_seconds > 120 (student took > 2 minutes to respond)
+
+    Intent rules (applied in order, first match wins):
+      1. Very short / gibberish  → accidental   (confidence 1.0)
+      2. Pure MCQ letter (A/B/C/D alone) after tutor asked a question
+                                 → answer_attempt (0.90)
+      3. Ends with "?"           → question       (0.85)
+      4. Contains explicit answer phrasing
+                                 → answer_attempt (0.80)
+      5. Ambiguous               → LLM classifier (returned confidence)
+    """
+    stripped = message.strip()
+
+    # ── Metacognitive signal detection (independent of intent) ────────────────
+    metacognitive_signal: str | None = None
+
+    if latency_seconds > 120:
+        metacognitive_signal = "silence"
+    else:
+        _positive_patterns = [
+            r"\bi (get|understand|see) (it|now|this)\b",
+            r"\bthat makes sense\b",
+            r"\bgot it\b",
+            r"\bi see\b",
+            r"\bmakes sense\b",
+            r"\bnow i (get|understand|see)\b",
+            r"\boh (i see|ok|okay|that makes sense)\b",
+        ]
+        _negative_patterns = [
+            r"\bi (don'?t|do not) (get|understand)\b",
+            r"\bi'?m (lost|confused|stuck)\b",
+            r"\bno idea\b",
+            r"\bdon'?t (get|understand) (it|this)\b",
+            r"\bwhat (does|do) (this|that|it) mean\b",
+            r"\bi'?m not sure (how|why|what)\b",
+            r"\bstill (confused|lost|don'?t understand)\b",
+        ]
+        if any(re.search(p, stripped, re.IGNORECASE) for p in _positive_patterns):
+            metacognitive_signal = "positive"
+        elif any(re.search(p, stripped, re.IGNORECASE) for p in _negative_patterns):
+            metacognitive_signal = "negative"
+
+    # ── Intent classification ─────────────────────────────────────────────────
+
+    # Rule 1: too short or clearly accidental
+    if len(stripped) < 3:
+        return {"intent": "accidental", "confidence": 1.0, "metacognitive_signal": metacognitive_signal}
+    # All non-alphanumeric / random keyboard mashing
+    if len(stripped) <= 8 and not re.search(r"[a-zA-Z]", stripped):
+        return {"intent": "accidental", "confidence": 0.95, "metacognitive_signal": metacognitive_signal}
+
+    # Rule 2: single MCQ letter, and the last tutor message contained a question
+    if re.fullmatch(r"[A-Da-d]\.?", stripped):
+        last_tutor = next(
+            (m["content"] for m in reversed(history) if m.get("role") == "assistant"),
+            "",
+        )
+        if "?" in last_tutor or any(
+            marker in last_tutor for marker in ["A.", "B.", "C.", "D.", "(A)", "(B)"]
+        ):
+            return {"intent": "answer_attempt", "confidence": 0.90, "metacognitive_signal": metacognitive_signal}
+
+    # Rule 3: ends with a question mark → asking for help, not answering
+    if stripped.endswith("?"):
+        return {"intent": "question", "confidence": 0.85, "metacognitive_signal": metacognitive_signal}
+
+    # Rule 4: explicit answer phrasing
+    answer_phrases = [
+        r"\bmy answer is\b", r"\bi think (?:it'?s?|the answer)\b",
+        r"\bthe answer is\b", r"^(?:it'?s?|that'?s?) ",
+        r"\b(?:equals?|=)\s*\d",
+    ]
+    if any(re.search(p, stripped, re.IGNORECASE) for p in answer_phrases):
+        return {"intent": "answer_attempt", "confidence": 0.80, "metacognitive_signal": metacognitive_signal}
+
+    # Rule 5: ambiguous — LLM classifier using flash (fast + cheap)
+    try:
+        from backend.app.agents.vertex_llm import get_llm
+        llm = get_llm()
+        recent = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:200]}"
+            for m in history[-4:]
+        )
+        clf_prompt = f"""Classify this student message in a tutoring chat.
+
+Recent conversation:
+{recent}
+
+Student message: "{stripped}"
+
+Respond with ONLY a JSON object:
+{{"intent": "answer_attempt"|"question"|"conversation", "confidence": 0.0-1.0}}
+
+- answer_attempt: student is answering a practice question the tutor asked
+- question: student is asking for help or explanation
+- conversation: casual chat, not answering or asking a specific question"""
+
+        raw = llm.generate_json(clf_prompt)
+        if isinstance(raw, dict) and "intent" in raw:
+            intent = raw["intent"]
+            conf   = float(raw.get("confidence", 0.5))
+            if intent in ("answer_attempt", "question", "conversation"):
+                return {"intent": intent, "confidence": conf, "metacognitive_signal": metacognitive_signal}
+    except Exception:
+        pass  # Fall through to default
+
+    # Default: treat as conversation — safe, no state change
+    return {"intent": "conversation", "confidence": 0.6, "metacognitive_signal": metacognitive_signal}
+
+
+# ── Session working memory helpers ────────────────────────────────────────────
+
+async def _load_chat_session(student_id: str) -> dict:
+    """
+    Load the ChatSession row for a student from Postgres.
+    Returns a plain dict; creates a default record if none exists.
+    """
+    from sqlalchemy import select, insert
+    from backend.app.db.engine import _init, _session_factory
+    from backend.app.db.models.chat import ChatSession
+
+    _init()
+    async with _session_factory() as db:
+        row = (await db.execute(
+            select(ChatSession).where(ChatSession.student_id == student_id)
+        )).scalar_one_or_none()
+
+        if row is None:
+            return {
+                "student_id":            student_id,
+                "current_node_id":       None,
+                "current_node_code":     None,
+                "pedagogical_strategy":  "socratic",
+                "consecutive_struggles": 0,
+                "last_message_at":       None,
+            }
+        return {
+            "student_id":            row.student_id,
+            "current_node_id":       row.current_node_id,
+            "current_node_code":     row.current_node_code,
+            "pedagogical_strategy":  row.pedagogical_strategy,
+            "consecutive_struggles": row.consecutive_struggles,
+            "last_message_at":       row.last_message_at,
+        }
+
+
+async def _save_chat_session(
+    student_id:            str,
+    current_node_id:       str | None,
+    current_node_code:     str | None,
+    consecutive_struggles: int,
+    pedagogical_strategy:  str,
+) -> None:
+    """Upsert the ChatSession row for a student."""
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from backend.app.db.engine import _init, _session_factory
+    from backend.app.db.models.chat import ChatSession
+
+    _init()
+    now = datetime.now(timezone.utc)
+    async with _session_factory() as db:
+        existing = (await db.execute(
+            select(ChatSession).where(ChatSession.student_id == student_id)
+        )).scalar_one_or_none()
+
+        if existing is None:
+            import uuid
+            db.add(ChatSession(
+                id=uuid.uuid4(),
+                student_id=student_id,
+                current_node_id=current_node_id,
+                current_node_code=current_node_code,
+                pedagogical_strategy=pedagogical_strategy,
+                consecutive_struggles=consecutive_struggles,
+                last_message_at=now,
+            ))
+        else:
+            existing.current_node_id       = current_node_id
+            existing.current_node_code     = current_node_code
+            existing.pedagogical_strategy  = pedagogical_strategy
+            existing.consecutive_struggles = consecutive_struggles
+            existing.last_message_at       = now
+        await db.commit()
+
+
+async def _record_failure_chain(
+    student_id:          str,
+    failed_node_id:      str,
+    failed_node_code:    str | None,
+    root_prereq_node_id: str | None,
+    root_prereq_code:    str | None,
+    signal_source:       str,
+    hops_to_lca:         int | None,
+) -> None:
+    """Append one row to the failure_chains audit table."""
+    import uuid
+    from backend.app.db.engine import _init, _session_factory
+    from backend.app.db.models.chat import FailureChain
+
+    _init()
+    async with _session_factory() as db:
+        db.add(FailureChain(
+            id=uuid.uuid4(),
+            student_id=student_id,
+            failed_node_id=failed_node_id,
+            failed_node_code=failed_node_code,
+            root_prereq_node_id=root_prereq_node_id,
+            root_prereq_code=root_prereq_code,
+            signal_source=signal_source,
+            hops_to_lca=hops_to_lca,
+        ))
+        await db.commit()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -399,15 +657,155 @@ def _build_system_from_mastery(
 
 # ── Endpoint ─────────────────────────────────────────────────────────────────
 
+_STRATEGY_PROMPTS: dict[str, str] = {
+    "socratic": (
+        "\n=== PEDAGOGICAL STRATEGY: SOCRATIC ===\n"
+        "Guide the student to the answer through questions. "
+        "Do NOT give the answer directly. Ask one focused leading question at a time."
+    ),
+    "visual": (
+        "\n=== PEDAGOGICAL STRATEGY: VISUAL / CONCRETE EXAMPLES ===\n"
+        "The student has struggled with this concept. Shift away from abstract explanation.\n"
+        "Use vivid concrete examples, real-world analogies, step-by-step worked examples, "
+        "or describe a visual representation (number line, diagram, table). "
+        "Show, don't just tell."
+    ),
+    "cra": (
+        "\n=== PEDAGOGICAL STRATEGY: CONCRETE → REPRESENTATIONAL → ABSTRACT (CRA) ===\n"
+        "The student is significantly struggling. Use the CRA approach:\n"
+        "  1. CONCRETE: Describe the concept using physical objects (counters, blocks, fingers).\n"
+        "  2. REPRESENTATIONAL: Draw or describe a picture/diagram of those objects.\n"
+        "  3. ABSTRACT: Only then introduce the symbolic/mathematical notation.\n"
+        "Start at step 1 and only move forward when the student confirms understanding."
+    ),
+}
+
+
+def _choose_strategy(consecutive_struggles: int) -> str:
+    if consecutive_struggles >= 4:
+        return "cra"
+    if consecutive_struggles >= 2:
+        return "visual"
+    return "socratic"
+
+
 @router.post("/tutor", summary="Chat with the AI tutor about your assessment results")
 async def chat_with_tutor(body: TutorRequest) -> dict[str, Any]:
     """
     Multi-turn AI tutor grounded in the student's full assessment results.
-    Uses Gemini 2.5 Pro for stronger reasoning and pedagogical quality,
-    falling back to the configured gemini_model if 2.5-pro is unavailable.
+
+    Pipeline per request:
+      1. Intent detection (answer_attempt / question / conversation / accidental)
+         + metacognitive signal (positive / negative / silence)
+      2. Load session working memory from Postgres (strategy, struggles, current node)
+      3. If negative signal or silence → run LCA search → inject bridge prompt
+      4. Inject strategy-specific pedagogical instruction (Socratic / Visual / CRA)
+      5. LLM call
+      6. Parse EVAL_JSON (if answer_attempt) → build pending_action
+      7. Update session state + record failure chain if LCA triggered
+
+    The frontend must call POST /chat/confirm_action with confirmed=true
+    before any BKT update is written to Neo4j.
     """
     import asyncio
+    import json
+    from neo4j import GraphDatabase
     from backend.app.agents.vertex_llm import get_llm
+    from backend.app.agents.lca_agent import find_lca
+    from backend.app.core.settings import settings
+
+    history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
+    loop = asyncio.get_event_loop()
+
+    # ── Step 1: intent + metacognitive detection ──────────────────────────────
+    intent = await loop.run_in_executor(
+        None,
+        lambda: _detect_intent(body.message, history_dicts, body.latency_seconds),
+    )
+
+    is_answer_attempt  = intent["intent"] == "answer_attempt" and intent["confidence"] >= 0.70
+    meta_signal        = intent.get("metacognitive_signal")  # positive | negative | silence | None
+
+    # ── Step 2: load session working memory ───────────────────────────────────
+    try:
+        session_state = await _load_chat_session(body.student_id)
+    except Exception as exc:
+        logger.warning(f"Could not load chat session for {body.student_id}: {exc}")
+        session_state = {
+            "current_node_id": None, "current_node_code": None,
+            "pedagogical_strategy": "socratic", "consecutive_struggles": 0,
+        }
+
+    consecutive_struggles = session_state["consecutive_struggles"]
+    strategy              = session_state["pedagogical_strategy"]
+    current_node_id       = session_state["current_node_id"]
+    current_node_code     = session_state["current_node_code"]
+
+    # ── Step 3: LCA + bridge prompt (triggered by negative/silence signal) ────
+    lca_result:    dict | None = None
+    bridge_block:  str         = ""
+    signal_source: str | None  = None
+
+    should_find_lca = (
+        meta_signal in ("negative", "silence") or consecutive_struggles >= 4
+    ) and current_node_id is not None
+
+    if should_find_lca:
+        signal_source = meta_signal or "consecutive_struggles"
+        try:
+            neo4j_driver = GraphDatabase.driver(
+                settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+            )
+            lca_result = await loop.run_in_executor(
+                None,
+                lambda: find_lca(
+                    neo4j_driver,
+                    student_id=body.student_id,
+                    node_id=current_node_id,
+                    db=settings.neo4j_database,
+                ),
+            )
+            neo4j_driver.close()
+        except Exception as exc:
+            logger.warning(f"LCA search failed: {exc}")
+
+        if lca_result:
+            lca_code = lca_result.get("code", "")
+            lca_desc = lca_result.get("description", "")
+            lca_hops = lca_result.get("hops", "?")
+            bridge_block = (
+                f"\n=== BRIDGE INSTRUCTION ===\n"
+                f"The student just signaled confusion (signal: {signal_source}).\n"
+                f"LCA analysis found they have mastered '{lca_code}: {lca_desc}' "
+                f"({lca_hops} concept{'s' if lca_hops != 1 else ''} earlier in the prerequisite chain).\n"
+                f"Bridge strategy:\n"
+                f"  1. Ask the student to explain '{lca_code}' back to you in their own words.\n"
+                f"  2. Once they demonstrate that foundation, show a single step connecting "
+                f"'{lca_code}' to the current concept '{current_node_code or 'this concept'}'.\n"
+                f"  3. Do NOT jump to the full concept — build one bridge step at a time."
+            )
+
+            # Record failure chain async (fire-and-forget)
+            try:
+                await _record_failure_chain(
+                    student_id=body.student_id,
+                    failed_node_id=current_node_id,
+                    failed_node_code=current_node_code,
+                    root_prereq_node_id=lca_result.get("node_id"),
+                    root_prereq_code=lca_code,
+                    signal_source=signal_source,
+                    hops_to_lca=lca_result.get("hops"),
+                )
+            except Exception as exc:
+                logger.warning(f"Could not record failure chain: {exc}")
+
+    # ── Step 4: choose strategy and build system prompt ───────────────────────
+    # If the student sent a positive metacognitive signal → reset struggles
+    if meta_signal == "positive":
+        consecutive_struggles = 0
+        strategy = "socratic"
+
+    strategy = _choose_strategy(consecutive_struggles)
 
     system_prompt = _build_system_prompt(
         student_id=body.student_id,
@@ -416,33 +814,245 @@ async def chat_with_tutor(body: TutorRequest) -> dict[str, Any]:
         ctx=body.context,
     )
 
-    history = [{"role": m.role, "content": m.content} for m in body.history]
+    # Inject bridge block (if LCA found) before strategy instruction
+    if bridge_block:
+        system_prompt += bridge_block
 
+    # Inject strategy-specific pedagogical instruction
+    system_prompt += _STRATEGY_PROMPTS.get(strategy, _STRATEGY_PROMPTS["socratic"])
+
+    # If we think the student is answering a practice question, ask the LLM
+    # to include a structured evaluation block at the end of its response.
+    if is_answer_attempt:
+        system_prompt += """
+
+=== ANSWER EVALUATION INSTRUCTION ===
+The student appears to be answering a practice question you posed.
+After your normal tutoring response, append EXACTLY this JSON block on a new line
+(no markdown fences, no extra text around it):
+
+EVAL_JSON:{"standard_code":"<code>","is_correct":true/false,"explanation":"<one sentence>"}
+
+Rules:
+- standard_code: the standard code of the question you asked (e.g. "3.NF.A.1")
+- is_correct: your honest judgment of whether the student's answer is mathematically/linguistically correct
+- explanation: brief explanation of why it is or is not correct
+- If you did NOT ask a specific practice question, omit the EVAL_JSON line entirely."""
+
+    # ── Step 5: LLM call ──────────────────────────────────────────────────────
     llm = get_llm()
-    loop = asyncio.get_event_loop()
 
     try:
-        response: str = await loop.run_in_executor(
+        raw_response: str = await loop.run_in_executor(
             None,
             lambda: llm.chat(
                 system=system_prompt,
-                history=history,
+                history=history_dicts,
                 message=body.message,
                 model=CHAT_MODEL,
             ),
         )
 
-        if not response or not response.strip():
+        if not raw_response or not raw_response.strip():
             raise ValueError("Empty response from model")
-
-        return {
-            "role": "assistant",
-            "content": response.strip(),
-            "model": CHAT_MODEL,
-        }
 
     except Exception as exc:
         logger.error(f"AI tutor chat failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # ── Step 6: extract evaluation block (if present) ─────────────────────────
+    pending_action: dict | None = None
+    clean_response = raw_response.strip()
+    eval_std_code: str | None = None
+    eval_is_correct: bool | None = None
+
+    if is_answer_attempt and "EVAL_JSON:" in raw_response:
+        try:
+            eval_line = next(
+                line for line in raw_response.splitlines()
+                if line.strip().startswith("EVAL_JSON:")
+            )
+            eval_str  = eval_line.strip()[len("EVAL_JSON:"):].strip()
+            eval_data = json.loads(eval_str)
+
+            eval_std_code   = eval_data.get("standard_code", "")
+            eval_is_correct = bool(eval_data.get("is_correct", False))
+            explanation     = eval_data.get("explanation", "")
+
+            if eval_std_code:
+                pending_action = PendingAction(
+                    student_id=body.student_id,
+                    standard_code=eval_std_code,
+                    student_answer=body.message.strip(),
+                    is_correct=eval_is_correct,
+                    confidence=intent["confidence"],
+                    explanation=explanation,
+                ).model_dump()
+
+            # Strip the EVAL_JSON line from the response shown to the student
+            clean_response = "\n".join(
+                line for line in raw_response.splitlines()
+                if not line.strip().startswith("EVAL_JSON:")
+            ).strip()
+
+        except Exception as exc:
+            logger.debug(f"Could not parse EVAL_JSON from tutor response: {exc}")
+
+    # ── Step 7: update session working memory ─────────────────────────────────
+    # Update current_node_id if we learned which standard was just practiced
+    if eval_std_code:
+        current_node_code = eval_std_code
+        # Resolve Neo4j node_id from standard code (best-effort, don't fail the request)
+        try:
+            neo4j_driver = GraphDatabase.driver(
+                settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+            )
+            def _resolve_node():
+                with neo4j_driver.session(database=settings.neo4j_database) as s:
+                    row = s.run(
+                        "MATCH (n:StandardsFrameworkItem {statementCode: $code}) "
+                        "WHERE n.normalizedStatementType = 'Standard' "
+                        "RETURN n.identifier AS nid LIMIT 1",
+                        code=eval_std_code,
+                    ).single()
+                    return row["nid"] if row else None
+            current_node_id = await loop.run_in_executor(None, _resolve_node)
+            neo4j_driver.close()
+        except Exception:
+            pass  # keep previous current_node_id
+
+    # Update struggle count
+    if eval_is_correct is True:
+        consecutive_struggles = 0
+    elif eval_is_correct is False and is_answer_attempt:
+        consecutive_struggles += 1
+
+    new_strategy = _choose_strategy(consecutive_struggles)
+
+    try:
+        await _save_chat_session(
+            student_id=body.student_id,
+            current_node_id=current_node_id,
+            current_node_code=current_node_code,
+            consecutive_struggles=consecutive_struggles,
+            pedagogical_strategy=new_strategy,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not save chat session for {body.student_id}: {exc}")
+
+    return {
+        "role":                  "assistant",
+        "content":               clean_response,
+        "model":                 CHAT_MODEL,
+        "intent":                intent["intent"],
+        "intent_confidence":     round(intent["confidence"], 2),
+        "metacognitive_signal":  meta_signal,
+        "pedagogical_strategy":  new_strategy,
+        "consecutive_struggles": consecutive_struggles,
+        "lca_triggered":         lca_result is not None,
+        "pending_action":        pending_action,
+    }
+
+
+@router.post("/confirm_action", summary="Confirm or discard a pending BKT update from chat")
+async def confirm_chat_action(body: ConfirmActionRequest) -> dict[str, Any]:
+    """
+    Called by the frontend after the student responds to the confirmation dialog.
+
+    confirmed=True  → writes BKT update to Neo4j (permanent)
+    confirmed=False → does nothing (student said it was accidental or wrong)
+
+    The frontend dialog should say something like:
+      "I marked that as correct for 3.NF.A.1. Should I record this? [Yes] [No, I mistyped]"
+    """
+    import asyncio
+    from neo4j import GraphDatabase
+    from backend.app.core.settings import settings
+    from backend.app.agents.evaluation_agent import (
+        _bkt_update, _get_student_mastery_and_params, _upsert_mastery
+    )
+
+    action = body.action
+
+    if not body.confirmed:
+        logger.info(
+            f"Chat action discarded (student declined): "
+            f"student={action.student_id} std={action.standard_code}"
+        )
+        return {"recorded": False, "reason": "student_declined"}
+
+    # Look up node identifier from standard code
+    driver = GraphDatabase.driver(
+        settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+    )
+
+    def _execute():
+        with driver.session() as session:
+            node_row = session.run(
+                """
+                MATCH (n:StandardsFrameworkItem {statementCode: $code})
+                WHERE n.normalizedStatementType = 'Standard'
+                RETURN n.identifier AS nid
+                LIMIT 1
+                """,
+                code=action.standard_code,
+            ).single()
+
+            if not node_row or not node_row["nid"]:
+                return None
+
+            nid = node_row["nid"]
+
+            p_before, p_slip, p_guess, p_transit = _get_student_mastery_and_params(
+                session, action.student_id, nid
+            )
+            p_after = _bkt_update(
+                p_before, action.is_correct, p_slip, p_guess, p_transit
+            )
+
+            count_row = session.run(
+                """
+                MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->
+                      (n:StandardsFrameworkItem {identifier: $nid})
+                RETURN coalesce(r.attempts, 0) AS att,
+                       coalesce(r.correct, 0)  AS cor
+                """,
+                sid=action.student_id, nid=nid,
+            ).single()
+            attempts = (count_row["att"] if count_row else 0) + 1
+            correct  = (count_row["cor"] if count_row else 0) + (1 if action.is_correct else 0)
+
+            _upsert_mastery(session, action.student_id, nid, p_after, attempts, correct)
+            return {"nid": nid, "p_before": p_before, "p_after": p_after}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _execute)
+        driver.close()
+
+        if not result:
+            return {
+                "recorded": False,
+                "reason": f"standard_code '{action.standard_code}' not found in knowledge graph",
+            }
+
+        logger.info(
+            f"Chat BKT confirmed: student={action.student_id} "
+            f"std={action.standard_code} correct={action.is_correct} "
+            f"p_mastery {result['p_before']:.3f} → {result['p_after']:.3f}"
+        )
+        return {
+            "recorded":      True,
+            "student_id":    action.student_id,
+            "standard_code": action.standard_code,
+            "is_correct":    action.is_correct,
+            "p_mastery_before": round(result["p_before"], 3),
+            "p_mastery_after":  round(result["p_after"], 3),
+        }
+
+    except Exception as exc:
+        driver.close()
+        logger.error(f"confirm_action failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

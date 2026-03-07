@@ -215,15 +215,88 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
         f"({sum(1 for g in gaps if g['hard_blocked'])} hard-blocked)"
     )
 
+    # ── Cognitive Load Pruning ────────────────────────────────────────────────
+    # For every hard-blocked node, write TEMPORARY_BLOCK relationships to all
+    # downstream nodes so select_standards_irt cannot surface them next session.
+    newly_blocked = _prune_downstream_nodes(state.student_id, hard_blocked)
+
     return {
         "gaps": gaps,
         "knowledge_state": knowledge_state,
         "hard_blocked_nodes": hard_blocked,
+        "newly_blocked_nodes": newly_blocked,
     }
+
+
+def _prune_downstream_nodes(student_id: str, hard_blocked_ids: list[str]) -> list[str]:
+    """
+    For each hard-blocked node, find its downstream nodes (up to 4 hops via
+    BUILDS_TOWARDS / PRECEDES) and create a
+        (:Student)-[:TEMPORARY_BLOCK {blocked_by, created_at}]->(:StandardsFrameworkItem)
+    relationship so the IRT selector skips them in future sessions.
+
+    Returns the list of newly-blocked node identifiers.
+    """
+    if not hard_blocked_ids:
+        return []
+
+    driver = _neo4j()
+    newly_blocked: list[str] = []
+    try:
+        with driver.session() as neo:
+            from datetime import datetime
+            now_str = datetime.utcnow().isoformat()
+
+            for blocker_nid in hard_blocked_ids:
+                # Find all downstream nodes
+                result = neo.run(
+                    """
+                    MATCH (blocker:StandardsFrameworkItem {identifier: $nid})
+                    MATCH (blocker)-[:BUILDS_TOWARDS|PRECEDES*1..4]->(downstream:StandardsFrameworkItem)
+                    WHERE downstream.identifier <> $nid
+                    RETURN DISTINCT downstream.identifier AS downstream_id
+                    LIMIT 50
+                    """,
+                    nid=blocker_nid,
+                )
+                downstream_ids = [r["downstream_id"] for r in result if r["downstream_id"]]
+
+                if not downstream_ids:
+                    continue
+
+                # Write TEMPORARY_BLOCK relationships (MERGE so idempotent)
+                neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})
+                    UNWIND $downstream_ids AS did
+                    MATCH (n:StandardsFrameworkItem {identifier: did})
+                    MERGE (s)-[b:TEMPORARY_BLOCK]->(n)
+                    ON CREATE SET b.blocked_by  = $blocker,
+                                  b.created_at  = $now
+                    ON MATCH  SET b.blocked_by  = $blocker,
+                                  b.updated_at  = $now
+                    """,
+                    sid=student_id,
+                    downstream_ids=downstream_ids,
+                    blocker=blocker_nid,
+                    now=now_str,
+                )
+                newly_blocked.extend(downstream_ids)
+                logger.info(
+                    f"Pruning: blocked {len(downstream_ids)} downstream nodes "
+                    f"from hard-block [{blocker_nid}] for student {student_id}"
+                )
+
+    except Exception as exc:
+        logger.warning(f"Cognitive load pruning failed (non-fatal): {exc}")
+    finally:
+        driver.close()
+
+    return list(set(newly_blocked))
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def route_after_gaps(state: AssessmentState) -> str:
-    """LangGraph conditional edge: remediate if gaps exist, else skip."""
-    return "remediate" if state.gaps else "write_report"
+    """LangGraph conditional edge: remediate if gaps exist, else go straight to judge_mastery."""
+    return "remediate" if state.gaps else "judge"

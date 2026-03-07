@@ -102,6 +102,9 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
     try:
         with driver.session() as session:
 
+            # Already-asked node identifiers (from prior batches in elastic stopping)
+            asked_ids = list({q.get("node_ref", "") for q in state.questions if q.get("node_ref")})
+
             def _query_nodes(grade: str, jur: str, category: str, dok: int, limit: int):
                 res = session.run(
                     """
@@ -113,6 +116,10 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
                       AND NOT (n.statementCode STARTS WITH 'MP')
                       AND NOT (n.statementCode CONTAINS '.MP')
                       AND size(n.description) > 20
+                      AND NOT n.identifier IN $asked_ids
+                      AND NOT EXISTS {
+                        MATCH (st:Student {id: $student_id})-[:TEMPORARY_BLOCK]->(n)
+                      }
                     RETURN n.identifier AS identifier,
                            n.statementCode AS code,
                            n.description AS description,
@@ -120,6 +127,7 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
                     ORDER BY rand() LIMIT $lim
                     """,
                     jur=jur, subject=subject_name, grade=grade, lim=limit,
+                    asked_ids=asked_ids, student_id=state.student_id,
                 )
                 return [
                     {**r.data(), "grade": grade, "category": category, "dok_level": dok,
@@ -233,23 +241,52 @@ def fetch_rag_context(state: AssessmentState) -> dict:
     driver = _neo4j()
     context_map: dict[str, Any] = {}
 
+    student_id = state.student_id
+
     try:
         with driver.session() as session:
             for nid in identifiers:
-                ctx: dict[str, Any] = {"prereqs": [], "siblings": [], "existing_questions": []}
+                ctx: dict[str, Any] = {
+                    "prereqs": [],
+                    "boundary": [],
+                    "siblings": [],
+                    "existing_questions": [],
+                }
 
-                # Prerequisites via BUILDS_TOWARDS / HAS_DEPENDENCY / DEFINES_UNDERSTANDING
+                # Prerequisites with student mastery levels
+                # Inward edges: (pre)-[:BUILDS_TOWARDS|...]->(n)
                 prereq_r = session.run(
                     """
                     MATCH (n:StandardsFrameworkItem {identifier: $id})
-                    OPTIONAL MATCH (pre:StandardsFrameworkItem)-[:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(n)
-                    RETURN collect(DISTINCT {code: pre.statementCode, description: pre.description})[..4] AS prereqs
+                    OPTIONAL MATCH (pre:StandardsFrameworkItem)
+                        -[:BUILDS_TOWARDS|HAS_DEPENDENCY|DEFINES_UNDERSTANDING]->(n)
+                    OPTIONAL MATCH (stu:Student {id: $sid})-[sk:SKILL_STATE]->(pre)
+                    RETURN collect(DISTINCT {
+                        code:        pre.statementCode,
+                        description: pre.description,
+                        mastery:     coalesce(sk.p_mastery, 0.0)
+                    })[..6] AS prereqs
                     """,
-                    id=nid,
+                    id=nid, sid=student_id,
                 )
                 row = prereq_r.single()
                 if row:
                     ctx["prereqs"] = [p for p in (row["prereqs"] or []) if p.get("code")]
+
+                # Boundary concepts: one hop FORWARD from this standard
+                # (n)-[:BUILDS_TOWARDS]->(beyond) — more advanced, student not ready for these yet
+                boundary_r = session.run(
+                    """
+                    MATCH (n:StandardsFrameworkItem {identifier: $id})
+                    OPTIONAL MATCH (n)-[:BUILDS_TOWARDS]->(beyond:StandardsFrameworkItem)
+                    WHERE beyond.normalizedStatementType = 'Standard'
+                    RETURN collect(DISTINCT beyond.statementCode)[..5] AS boundary_codes
+                    """,
+                    id=nid,
+                )
+                row = boundary_r.single()
+                if row:
+                    ctx["boundary"] = [c for c in (row["boundary_codes"] or []) if c]
 
                 # Domain siblings (same grade + subject)
                 sibling_r = session.run(
@@ -285,17 +322,38 @@ def fetch_rag_context(state: AssessmentState) -> dict:
     finally:
         driver.close()
 
-    # Build a text block for the LLM prompt
+    # Build a mastery-aware prompt block for the LLM
+    # Each standard gets three categorised lists:
+    #   AVAILABLE   — prerequisites the student has mastered (p ≥ 0.65): use freely
+    #   CAUTION     — prerequisites the student knows partially (0 < p < 0.65): keep simple
+    #   DO NOT USE  — concepts one level beyond this standard: not yet in scope
     lines = []
     for node in nodes:
-        nid = node["identifier"]
-        ctx = context_map.get(nid, {})
-        if ctx.get("prereqs"):
-            lines.append(f"  {node.get('code','')}: prereqs → {[p['code'] for p in ctx['prereqs']]}")
-        if ctx.get("existing_questions"):
-            lines.append(f"  AVOID repeating stems: {ctx['existing_questions']}")
+        nid  = node["identifier"]
+        code = node.get("code") or node.get("statementCode", "")
+        ctx  = context_map.get(nid, {})
 
-    rag_block = "KG Context:\n" + "\n".join(lines) if lines else ""
+        prereqs   = ctx.get("prereqs", [])
+        boundary  = ctx.get("boundary", [])
+        existing  = ctx.get("existing_questions", [])
+
+        available = [p["code"] for p in prereqs if p.get("mastery", 0.0) >= 0.65]
+        caution   = [p["code"] for p in prereqs if 0.0 < p.get("mastery", 0.0) < 0.65]
+
+        parts = [f"[{code}]"]
+        if available:
+            parts.append(f"  AVAILABLE prereqs (student knows these — use freely): {available}")
+        if caution:
+            parts.append(f"  CAUTION prereqs (partial knowledge — keep vocabulary simple): {caution}")
+        if boundary:
+            parts.append(f"  DO NOT USE (beyond this standard, student not ready): {boundary}")
+        if existing:
+            parts.append(f"  AVOID repeating these stems: {existing}")
+
+        if len(parts) > 1:
+            lines.extend(parts)
+
+    rag_block = "Prerequisite-Aware KG Context:\n" + "\n".join(lines) if lines else ""
 
     return {"rag_context_map": context_map, "rag_prompt_block": rag_block}
 
@@ -348,6 +406,11 @@ Rules:
 6. Questions should match the student's ability: θ={state.theta:+.2f} (0=average, positive=strong, negative=struggling)
 7. Do NOT repeat any stems listed under AVOID above
 8. CRITICAL: Do NOT generate questions that require a visual, image, diagram, line plot, chart, table, or any graphic that cannot be displayed as plain text. Every question must be 100% self-contained in words and numbers only. If a standard normally uses visuals (e.g. line plots, bar charts, geometric figures), write a word-problem version instead.
+9. PREREQUISITE CONSTRAINT: For each standard, the KG Context above lists three tiers:
+   - AVAILABLE prereqs: the student has mastered these — your question MAY assume this knowledge
+   - CAUTION prereqs: partial knowledge — keep vocabulary and steps simple for these
+   - DO NOT USE: concepts beyond this standard — never introduce these in the question or answer choices
+   A student must be able to solve the question using ONLY the AVAILABLE skills. If a skill appears under DO NOT USE, it must not appear anywhere in the question, options, or solution path.
 
 Return ONLY a valid JSON array. Each element must be:
 {{"id":"<uuid>","type":"multiple_choice","question":"<text>","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","dok_level":1,"category":"prerequisite|target","standard_code":"<code>","node_index":<int>}}"""

@@ -97,3 +97,37 @@ class AssessmentState(BaseModel):
     # ── Postgres session tracking ─────────────────────────────────────────────
     pg_session_id: str | None = None   # UUID string of AssessmentSession row
     pg_student_uuid: str | None = None # UUID string of Student row
+
+    # ── Elastic Stopping (Adaptive CAT) ───────────────────────────────────────
+    # SE < 0.3 → ability estimate is precise enough; SE ≥ 0.3 → need more questions
+    se: float = 9.99                            # Rasch Standard Error of θ estimate
+    total_answered: int = 0                     # cumulative answers across all batches
+    needs_more_questions: bool = False          # True when SE is still high
+    additional_questions: list[dict[str, Any]] = Field(default_factory=list)
+
+    # ── Confusion Signal (Live Metacognitive Interrupt) ────────────────────────
+    confusion_signal: bool = False              # True when student signals "I don't get this"
+    confusion_chat: str = ""                    # Raw chat message from student
+    lca_safety_nets: dict[str, Any] = Field(default_factory=dict)  # std_code → LCA ancestor
+
+    # ── Fidelity Multiplier ────────────────────────────────────────────────────
+    # question_id → time in milliseconds the student took to answer
+    time_per_question: dict[str, float] = Field(default_factory=dict)
+
+    # ── Neuro-Symbolic Signal Bridge (φ) ──────────────────────────────────────
+    # Dynamic Weight Auditor output — one entry per answered question
+    # Each entry: {phi, reason, target_node, gap_tag}
+    # φ ∈ [-1.0, 1.0]:  1.0 = Fluent  0.5 = Partial  -1.0 = Hard Block
+    phi_signals: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    # Live session chat buffer — raw student messages accumulated this session
+    # Each entry: {question_id, chat_message, timestamp}
+    session_context: list[dict[str, Any]] = Field(default_factory=list)
+
+    # Recursive Pivot state — set when φ < 0 triggers a safety-net jump
+    pivot_node: str | None = None          # safety-net node identifier
+    pivot_instruction: str = ""            # bridge text: "Now that you know X, let's try Y"
+
+    # ── Cognitive Load Pruning ─────────────────────────────────────────────────
+    # node identifiers newly given TEMPORARY_BLOCK this session
+    newly_blocked_nodes: list[str] = Field(default_factory=list)

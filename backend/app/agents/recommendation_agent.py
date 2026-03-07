@@ -182,7 +182,7 @@ Return ONLY a valid JSON array:
             "rank":             rank,
             "node_identifier":  nid,
             "standard_code":    code,
-            "description":      detail.get("description", ""),
+            "description":      detail.get("description") or "",
             "grade":            detail.get("grade", state.grade),
             "difficulty_beta":  round(beta, 2),
             "success_prob":     round(p_succ, 2),

@@ -33,6 +33,12 @@ class BKTParams:
     correct: int = 0
 
 
+# Defaults used when a node has not yet been fitted by BKTFitter
+_DEFAULT_P_SLIP    = 0.08
+_DEFAULT_P_GUESS   = 0.25
+_DEFAULT_P_TRANSIT = 0.10
+
+
 class BayesianSkillTracker:
     """
     Graph-native Bayesian Knowledge Tracing.
@@ -62,14 +68,25 @@ class BayesianSkillTracker:
         student_id: str,
         node_identifier: str,
         is_correct: bool,
+        mastery_penalty: float = 0.0,
     ) -> dict[str, Any]:
-        """Update BKT posterior for one student-skill observation."""
+        """
+        Update BKT posterior for one student-skill observation.
+
+        Uses per-skill fitted params (p_slip, p_guess, p_transit) stored on
+        the StandardsFrameworkItem node if available, otherwise falls back
+        to system defaults.  mastery_penalty (0–0.5) is subtracted from the
+        current mastery before the update to account for misconceptions.
+        """
         cur = self._get_or_create_skill_state(student_id, node_identifier)
 
-        p_ln = cur["p_mastery"]
-        p_s  = cur["p_slip"]
-        p_g  = cur["p_guess"]
-        p_t  = cur["p_transit"]
+        # Apply misconception penalty before update
+        p_ln = max(0.001, cur["p_mastery"] - mastery_penalty)
+
+        # Use per-skill fitted params if present on the node
+        p_s = cur.get("bkt_p_slip",    _DEFAULT_P_SLIP)
+        p_g = cur.get("bkt_p_guess",   _DEFAULT_P_GUESS)
+        p_t = cur.get("bkt_p_transit", _DEFAULT_P_TRANSIT)
 
         if is_correct:
             num = p_ln * (1.0 - p_s)
@@ -233,25 +250,33 @@ class BayesianSkillTracker:
                 MATCH (n:StandardsFrameworkItem {identifier: $nid})
                 MERGE (s)-[sk:SKILL_STATE]->(n)
                 ON CREATE SET
-                    sk.p_mastery  = 0.1,
-                    sk.p_transit  = 0.1,
-                    sk.p_slip     = 0.05,
-                    sk.p_guess    = 0.25,
+                    sk.p_mastery   = 0.1,
                     sk.nano_weight = 10.0,
-                    sk.attempts   = 0,
-                    sk.correct    = 0,
-                    sk.created_at = datetime()
-                RETURN sk.p_mastery   AS p_mastery,
-                       sk.p_transit   AS p_transit,
-                       sk.p_slip      AS p_slip,
-                       sk.p_guess     AS p_guess,
-                       sk.nano_weight AS nano_weight,
-                       sk.attempts    AS attempts,
-                       sk.correct     AS correct
-            """, sid=student_id, nid=node_identifier)
+                    sk.attempts    = 0,
+                    sk.correct     = 0,
+                    sk.created_at  = datetime()
+                RETURN sk.p_mastery             AS p_mastery,
+                       sk.nano_weight           AS nano_weight,
+                       sk.attempts              AS attempts,
+                       sk.correct               AS correct,
+                       coalesce(n.bkt_p_slip,    $def_slip)    AS bkt_p_slip,
+                       coalesce(n.bkt_p_guess,   $def_guess)   AS bkt_p_guess,
+                       coalesce(n.bkt_p_transit, $def_transit) AS bkt_p_transit
+            """, sid=student_id, nid=node_identifier,
+                 def_slip=_DEFAULT_P_SLIP,
+                 def_guess=_DEFAULT_P_GUESS,
+                 def_transit=_DEFAULT_P_TRANSIT)
 
             record = result.single()
-            return dict(record) if record else BKTParams().__dict__
+            return dict(record) if record else {
+                "p_mastery":    0.1,
+                "nano_weight":  10.0,
+                "attempts":     0,
+                "correct":      0,
+                "bkt_p_slip":    _DEFAULT_P_SLIP,
+                "bkt_p_guess":   _DEFAULT_P_GUESS,
+                "bkt_p_transit": _DEFAULT_P_TRANSIT,
+            }
 
     def _write_skill_state(
         self,
