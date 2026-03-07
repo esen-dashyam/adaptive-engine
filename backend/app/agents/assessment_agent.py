@@ -78,7 +78,11 @@ def _parse_grade_subject(grade: str, subject: str, state_jurisdiction: str) -> t
     return grade_num, prereq_grade, subject_name, jurisdiction
 
 
-def select_standards_irt(state: AssessmentState) -> dict:
+def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
+    logger.info("━" * 60)
+    logger.info("  PHASE A — STEP 1/3 │ select_standards_irt")
+    logger.info(f"  student={state.student_id}  grade={state.grade}  subject={state.subject}  θ={state.theta:+.2f}")
+    logger.info("━" * 60)
     """
     Query Neo4j for candidate standards using the real schema, then rank by
     Fisher Information at the student's current θ.
@@ -178,6 +182,18 @@ def select_standards_irt(state: AssessmentState) -> dict:
 
     selected_prereq = [n for _, n in ranked if n["category"] == "prerequisite"][:n_prereq]
     selected_target = [n for _, n in ranked if n["category"] == "target"][:n_target]
+
+    # Cap total number of standards/questions using settings.agent_max_questions
+    max_q = getattr(settings, "agent_max_questions", None) or (len(selected_prereq) + len(selected_target))
+    if len(selected_prereq) + len(selected_target) > max_q:
+        total = len(selected_prereq) + len(selected_target)
+        prereq_ratio = len(selected_prereq) / total if total else 0.0
+        # Aim to preserve prereq/target mix while respecting max_q
+        desired_prereq = min(len(selected_prereq), max(1, int(round(max_q * prereq_ratio))))
+        desired_target = max_q - desired_prereq
+        selected_prereq = selected_prereq[:desired_prereq]
+        selected_target = selected_target[:desired_target]
+
     all_nodes = selected_prereq + selected_target
 
     difficulties = assign_difficulties(all_nodes)
@@ -205,6 +221,9 @@ def fetch_rag_context(state: AssessmentState) -> dict:
     Fetch GraphRAG context for selected nodes: prerequisites, siblings,
     domain labels, existing question stems (to avoid repetition).
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE A — STEP 2/3 │ fetch_rag_context  ({len(state.all_nodes)} nodes)")
+    logger.info("━" * 60)
     nodes = state.all_nodes
     if not nodes:
         return {"rag_context_map": {}, "rag_prompt_block": ""}
@@ -289,6 +308,9 @@ def generate_questions(state: AssessmentState) -> dict:
     Generate curriculum-aligned questions via Vertex AI / Gemini Flash.
     Uses the IRT-selected node set and RAG context.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE A — STEP 3/3 │ generate_questions  (asking Gemini for {len(state.all_nodes)} questions)")
+    logger.info("━" * 60)
     nodes = state.all_nodes
     if not nodes:
         return {"questions": [], "error": "No nodes to generate questions for"}

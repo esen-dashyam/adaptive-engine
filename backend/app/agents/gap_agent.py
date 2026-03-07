@@ -65,6 +65,7 @@ def fetch_kg_edges(state: AssessmentState) -> dict:
                     weight: coalesce(r2.weight, 0.7), rel_type: type(r2)
                 }) AS all_edges
                 UNWIND all_edges AS edge
+                WITH edge
                 WHERE edge.source IS NOT NULL AND edge.target IS NOT NULL
                 RETURN DISTINCT edge.source AS source, edge.target AS target,
                                 edge.weight AS weight, edge.rel_type AS rel_type
@@ -113,6 +114,9 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
     Combined node: fetch edges → run KST → identify gaps → rank by impact.
     Returns updated knowledge_state, hard_blocked_nodes, and gaps list.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 5/7 │ identify_and_rank_gaps  (KST propagation)")
+    logger.info("━" * 60)
     # Step A: fetch KG edges
     tested_ids = list({r.get("node_ref", "") for r in state.results if r.get("node_ref")})
     if not tested_ids:
@@ -139,6 +143,7 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
                     weight: coalesce(r2.weight, 0.7), rel_type: type(r2)
                 }) AS all_edges
                 UNWIND all_edges AS edge
+                WITH edge
                 WHERE edge.source IS NOT NULL AND edge.target IS NOT NULL
                 RETURN DISTINCT edge.source AS source, edge.target AS target,
                                 edge.weight AS weight, edge.rel_type AS rel_type
@@ -154,15 +159,17 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
                 MATCH (n:StandardsFrameworkItem {identifier: nid})
                 OPTIONAL MATCH (n)-[:PRECEDES|BUILDS_TOWARDS*1..3]->(downstream)
                 RETURN nid, count(DISTINCT downstream) AS downstream_count,
-                       n.code AS code, n.description AS description, n.grade AS grade
+                       n.statementCode AS code, n.description AS description,
+                       n.gradeLevelList AS grade_list
                 """,
                 ids=tested_ids,
             )
             for r in impact_result:
+                grade_list = r["grade_list"] or []
                 node_info[r["nid"]] = {
                     "code": r["code"] or "",
                     "description": r["description"] or "",
-                    "grade": r["grade"] or "",
+                    "grade": grade_list[0] if grade_list else "",
                     "downstream_count": r["downstream_count"] or 0,
                 }
     finally:

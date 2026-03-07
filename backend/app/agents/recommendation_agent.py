@@ -42,6 +42,9 @@ def generate_recommendations(state: AssessmentState) -> dict:
     Build a personalised learning path from the KST frontier + Rasch θ.
     Each recommendation is enriched with Vertex AI rationale.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 7/7 │ generate_recommendations  (ZPD frontier, θ={state.theta:+.3f})")
+    logger.info("━" * 60)
     if not state.knowledge_state:
         return {"recommendations": []}
 
@@ -70,14 +73,19 @@ def generate_recommendations(state: AssessmentState) -> dict:
                     """
                     UNWIND $ids AS nid
                     MATCH (n:StandardsFrameworkItem {identifier: nid})
-                    RETURN n.identifier AS identifier, n.code AS code,
-                           n.description AS description, n.grade AS grade,
-                           n.subject AS subject
+                    RETURN n.identifier  AS identifier,
+                           n.statementCode AS code,
+                           n.description   AS description,
+                           n.gradeLevelList AS grade_list,
+                           n.academicSubject AS subject
                     """,
                     ids=all_node_ids[:50],
                 )
                 for r in detail_result:
-                    node_details[r["identifier"]] = r.data()
+                    row = r.data()
+                    grade_list = row.get("grade_list") or []
+                    row["grade"] = grade_list[0] if grade_list else ""
+                    node_details[row["identifier"]] = row
     finally:
         driver.close()
 

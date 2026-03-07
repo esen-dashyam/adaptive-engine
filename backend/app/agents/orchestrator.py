@@ -48,25 +48,16 @@ def write_report(state: AssessmentState) -> dict:
     Compile the final assessment report from all agent outputs.
     Returns a summary dict that gets merged into state.
     """
-    from backend.app.agents.rasch import RaschSession
-
-    prereq_results = [r for r in state.results if r.get("category") == "prerequisite"]
-    target_results  = [r for r in state.results if r.get("category") == "target"]
-
-    prereq_score = (
-        sum(1 for r in prereq_results if r["is_correct"]) / max(len(prereq_results), 1)
-    )
-    target_score = (
-        sum(1 for r in target_results if r["is_correct"]) / max(len(target_results), 1)
-    )
-
-    high_gaps  = [g for g in state.gaps if g.get("priority") == "high"]
-    ready_next = [r for r in getattr(state, "recommendations", []) if r.get("rank", 99) <= 3]
-
-    logger.info(
-        f"Report: score={state.score:.2%} | θ={state.theta:+.3f} | "
-        f"gaps={len(state.gaps)} | remediation={len(state.remediation_plan)}"
-    )
+    logger.info("━" * 60)
+    logger.info("  PHASE B COMPLETE — FINAL REPORT")
+    logger.info("━" * 60)
+    logger.info(f"  Score         : {state.score:.2%}  ({sum(1 for r in state.results if r['is_correct'])}/{len(state.results)})")
+    logger.info(f"  Rasch θ       : {state.theta:+.3f}")
+    logger.info(f"  Gaps found    : {len(state.gaps)}  (hard-blocked: {len(state.hard_blocked_nodes)})")
+    logger.info(f"  Misconceptions: {len(state.misconceptions)}")
+    logger.info(f"  Remediation   : {len(state.remediation_plan)} gap(s) with exercises")
+    logger.info(f"  Recommendations: {len(getattr(state, 'recommendations', []))} next steps")
+    logger.info("━" * 60)
     return {}   # state is already fully populated; nothing new to add here
 
 

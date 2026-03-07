@@ -20,6 +20,7 @@ from backend.app.api.routes.students import router as students_router
 from backend.app.api.routes.rag import router as rag_router
 from backend.app.api.routes.agent import router as agent_router
 from backend.app.api.routes.rasch import router as rasch_router
+from backend.app.api.routes.chat import router as chat_router
 
 
 @asynccontextmanager
@@ -74,6 +75,7 @@ app.include_router(students_router,   prefix=settings.api_prefix)
 app.include_router(rag_router,        prefix=settings.api_prefix)
 app.include_router(agent_router,      prefix=settings.api_prefix)
 app.include_router(rasch_router,      prefix=settings.api_prefix)
+app.include_router(chat_router,       prefix=settings.api_prefix)
 
 
 @app.get("/", tags=["Health"])

@@ -130,6 +130,85 @@ class VertexLLM:
             logger.debug(f"Vertex REST call failed: {exc}")
         return None
 
+    def _call_with_payload(self, url: str, payload: dict) -> str | None:
+        """POST a pre-built Gemini payload to any REST endpoint with ADC Bearer token."""
+        token = self._get_adc_token()
+        if not token:
+            return None
+        try:
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+                timeout=90,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text")
+                )
+            logger.debug(f"REST {resp.status_code} ({url.split('/')[-1]}): {resp.text[:200]}")
+        except Exception as exc:
+            logger.debug(f"REST call failed: {exc}")
+        return None
+
+    def chat(
+        self,
+        system: str,
+        history: list[dict[str, str]],
+        message: str,
+        model: str | None = None,
+    ) -> str:
+        """
+        Multi-turn conversation with a system instruction.
+
+        history items: {"role": "user" | "assistant", "content": "..."}
+        Uses Gemini's native systemInstruction + multi-turn contents format.
+        Falls back to formatted single prompt if REST fails.
+        """
+        chat_model = model or settings.gemini_model
+
+        contents = []
+        for msg in history:
+            gemini_role = "model" if msg["role"] == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})
+        contents.append({"role": "user", "parts": [{"text": message}]})
+
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4096},
+        }
+
+        if settings.gcp_project_id:
+            text = self._call_with_payload(_GENAI_REST_URL.format(model=chat_model), payload)
+            if text:
+                logger.debug(f"Chat: used GenAI REST ({chat_model})")
+                return text
+
+        if settings.gcp_project_id:
+            for m in [chat_model, settings.gemini_model]:
+                url = _VERTEX_REST_URL.format(
+                    region=settings.gcp_region,
+                    project=settings.gcp_project_id,
+                    model=m,
+                )
+                text = self._call_with_payload(url, payload)
+                if text:
+                    logger.debug(f"Chat: used Vertex REST ({m})")
+                    return text
+
+        # Fallback: flatten to a single prompt
+        conv = [f"[System]\n{system}"]
+        for msg in history[-10:]:
+            role = "Student" if msg["role"] == "user" else "Tutor"
+            conv.append(f"[{role}]\n{msg['content']}")
+        conv.append(f"[Student]\n{message}\n[Tutor]")
+        return self.generate("\n\n".join(conv))
+
     def _call_sdk(self, prompt: str) -> str | None:
         """Call google.generativeai SDK with API key."""
         if not settings.gemini_api_key:
@@ -182,17 +261,38 @@ class VertexLLM:
         )
 
     def generate_json(self, prompt: str) -> Any:
-        """Generate text and parse as JSON (dict or list). Returns None on parse failure."""
+        """
+        Generate text and parse as JSON (dict or list).
+        - Unwraps dict wrappers like {"questions": [...]} automatically.
+        - Retries once if the first attempt returns None or a non-list dict.
+        Returns None on parse failure.
+        """
         full_prompt = (
             prompt
             + "\n\nIMPORTANT: Return ONLY valid JSON. No markdown fences, no commentary."
         )
-        text = self.generate(full_prompt)
-        return self._parse_json(text)
+        for attempt in range(2):
+            text = self.generate(full_prompt)
+            result = self._parse_json(text)
+
+            # Unwrap common dict wrappers returned by the model
+            if isinstance(result, dict):
+                for key in ("questions", "items", "data", "results", "assessment", "exercises"):
+                    if isinstance(result.get(key), list):
+                        result = result[key]
+                        break
+
+            if result is not None:
+                return result
+
+            if attempt == 0:
+                logger.warning("generate_json: first attempt returned None, retrying…")
+
+        return None
 
     @staticmethod
     def _parse_json(text: str) -> Any:
-        """Strip markdown fences and parse JSON."""
+        """Strip markdown fences and parse JSON. Tries array first, then object."""
         if not text:
             return None
         text = text.strip()

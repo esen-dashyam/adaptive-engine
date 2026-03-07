@@ -85,7 +85,9 @@ def grade_to_difficulty(grade: str, dok_level: int = 2, category: str = "target"
 
     'prerequisite' questions are one grade easier than target questions.
     """
-    key = grade.lower().replace("k", "k").strip()
+    if not grade:
+        return 0.0
+    key = str(grade).lower().replace("k", "k").strip()
     if key.startswith("k"):
         key = "k"
     base = GRADE_DIFFICULTY.get(key, 0.0)

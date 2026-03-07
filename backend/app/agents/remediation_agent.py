@@ -46,6 +46,9 @@ def generate_remediation(state: AssessmentState) -> dict:
     Generate targeted remediation exercises for all identified gaps.
     Uses Vertex AI to create exercises informed by misconceptions + θ.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 6/7 │ generate_remediation  ({len(state.gaps[:MAX_GAPS_TO_REMEDIATE])} gaps → Gemini)")
+    logger.info("━" * 60)
     gaps = state.gaps[:MAX_GAPS_TO_REMEDIATE]
     if not gaps:
         return {"remediation_plan": []}

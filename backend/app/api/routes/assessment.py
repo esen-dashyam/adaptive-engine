@@ -117,6 +117,9 @@ async def generate_assessment(body: AssessmentRequest) -> dict[str, Any]:
     from backend.app.agent.state import AssessmentState
 
     try:
+        logger.info("═" * 60)
+        logger.info(f"  ▶ PHASE A START │ student={body.student_id}  grade={body.grade}  subject={body.subject}  state={body.state}")
+        logger.info("═" * 60)
         # Load student's current θ from Neo4j (or default 0.0 for new students)
         theta = await _load_student_theta(body.student_id)
 
@@ -204,6 +207,9 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
     from backend.app.agent.state import AssessmentState
 
     try:
+        logger.info("═" * 60)
+        logger.info(f"  ▶ PHASE B START │ student={body.student_id}  grade={body.grade}  answers={len(body.answers)}")
+        logger.info("═" * 60)
         theta = await _load_student_theta(body.student_id)
 
         # Reconstruct question list from submitted answers for Phase B

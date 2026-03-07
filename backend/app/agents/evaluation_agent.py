@@ -83,6 +83,10 @@ def _upsert_mastery(session, student_id: str, node_id: str, p_mastery: float,
 
 def score_answers(state: AssessmentState) -> dict:
     """Compare submitted answers against correct answers; build results list."""
+    logger.info("━" * 60)
+    logger.info("  PHASE B — STEP 1/7 │ score_answers")
+    logger.info(f"  {len(state.submitted_answers)} answers submitted for {len(state.questions)} questions")
+    logger.info("━" * 60)
     q_map = {q["id"]: q for q in state.questions}
     results = []
     correct_count = 0
@@ -128,6 +132,9 @@ def update_rasch(state: AssessmentState) -> dict:
     Processes responses in the order they were submitted to simulate
     live adaptive updating.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 2/7 │ update_rasch  (initial θ={state.theta:+.3f})")
+    logger.info("━" * 60)
     rasch = RaschSession(initial_theta=state.theta)
     updated_results = list(state.results)
 
@@ -161,6 +168,10 @@ def detect_misconceptions(state: AssessmentState) -> dict:
     The LLM response identifies the root misconception and affected concept nodes,
     which the KST layer will use to lower mastery weights on related nodes.
     """
+    wrong = [r for r in state.results if not r["is_correct"]]
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 3/7 │ detect_misconceptions  ({len(wrong)} wrong answers → Gemini)")
+    logger.info("━" * 60)
     wrong_answers = [r for r in state.results if not r["is_correct"]]
     if not wrong_answers:
         return {"misconceptions": [], "misconception_weights": {}}
@@ -233,6 +244,9 @@ def update_bkt(state: AssessmentState) -> dict:
     Update BKT mastery probabilities in Neo4j for each tested standard.
     Also fills mastery_before / mastery_after into results.
     """
+    logger.info("━" * 60)
+    logger.info(f"  PHASE B — STEP 4/7 │ update_bkt  ({len(state.results)} nodes → Neo4j SKILL_STATE)")
+    logger.info("━" * 60)
     driver = _neo4j()
     mastery_updates: dict[str, float] = {}
     updated_results = list(state.results)
