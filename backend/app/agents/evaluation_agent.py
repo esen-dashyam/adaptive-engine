@@ -69,6 +69,10 @@ def _bkt_update(
         posterior = (p_mastery * p_slip) / (denom + 1e-9)
     # φ-modulated transition (φ can be negative → un-learning)
     updated = posterior + (1.0 - posterior) * (p_transit * phi)
+    # Safety floor: a single LLM observation cannot erase more than 0.15 of
+    # accumulated mastery. This prevents a mis-interpreted chat message from
+    # wiping out weeks of student progress in one turn.
+    updated = max(p_mastery - 0.15, updated)
     return max(0.01, min(0.999, updated))
 
 

@@ -371,11 +371,13 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
     from datetime import datetime
     from neo4j import GraphDatabase
     from backend.app.core.settings import settings
+    from backend.app.student.bkt_fitter import (
+        DEFAULT_P_INIT     as P_INIT,
+        DEFAULT_P_SLIP     as P_SLIP,
+        DEFAULT_P_GUESS    as P_GUESS,
+        EXERCISE_P_TRANSIT as P_LEARN,   # higher learning rate for targeted practice
+    )
 
-    P_SLIP  = 0.10
-    P_GUESS = 0.20
-    P_LEARN = 0.20
-    P_INIT  = 0.10
     EMA_LR  = 0.05
 
     def _bkt_update(p: float, correct: bool) -> float:
@@ -385,7 +387,9 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
         else:
             denom = p * P_SLIP + (1 - p) * (1 - P_GUESS)
             posterior = (p * P_SLIP) / (denom + 1e-9)
-        return min(1.0, posterior + (1 - posterior) * P_LEARN)
+        # Safety floor: cannot drop more than 0.15 in one cycle (mirrors evaluation_agent)
+        updated = posterior + (1 - posterior) * P_LEARN
+        return min(1.0, max(p - 0.15, updated))
 
     session_id = body.session_id or str(_uuid.uuid4())
     now_str    = datetime.utcnow().isoformat()
@@ -544,6 +548,15 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
                         """,
                         sid=body.student_id, nid=body.node_identifier,
                     ).single()
+                    # Reset failure_streak so the three-strike counter starts fresh
+                    neo.run(
+                        """
+                        MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->
+                              (n:StandardsFrameworkItem {identifier: $nid})
+                        SET sk.failure_streak = 0
+                        """,
+                        sid=body.student_id, nid=body.node_identifier,
+                    )
                     return int(cleared["cleared"]) if cleared else 0
 
             n_cleared = await loop.run_in_executor(None, _clear_blocks)
@@ -686,6 +699,24 @@ Return JSON: {{"phi": <float>, "reason": "<1 sentence>", "gap_tag": "<sub-skill 
                     phi=phi,
                 )
                 _upsert_mastery(neo, body.student_id, body.node_identifier, p_after, attempts, correct_count)
+
+                # Persist gap_tag if the LLM identified a specific sub-skill gap.
+                # Stored as a list on SKILL_STATE (capped at 5 most recent, deduplicated).
+                if gap_tag:
+                    neo.run(
+                        """
+                        MATCH (s:Student {id: $sid})-[r:SKILL_STATE]->
+                              (n:StandardsFrameworkItem {identifier: $nid})
+                        SET r.gap_tags = CASE
+                            WHEN r.gap_tags IS NULL            THEN [$tag]
+                            WHEN $tag IN r.gap_tags            THEN r.gap_tags
+                            WHEN size(r.gap_tags) >= 5         THEN tail(r.gap_tags) + [$tag]
+                            ELSE r.gap_tags + [$tag]
+                        END
+                        """,
+                        sid=body.student_id, nid=body.node_identifier, tag=gap_tag,
+                    )
+
                 return p_before, p_after
 
         p_before, p_after = await loop.run_in_executor(None, _do_bkt)

@@ -509,6 +509,16 @@ async def get_student_context(
         logger.warning(f"Context load failed: {exc}")
         rows, total_in_kg = [], 0
 
+    # ── Filter out orphaned nodes ──────────────────────────────────────────────
+    # SKILL_STATE edges sometimes point to nodes with no statementCode/description
+    # (test stubs, UUID-only exercise nodes, "node123" dummy entries). Keeping them
+    # injects unreadable UUIDs into Gemini's system prompt and corrupts the gap list.
+    rows = [
+        r for r in rows
+        if r.get("code") and r.get("description")
+        and not str(r.get("code", "")).startswith("node")
+    ]
+
     if not rows:
         return {
             "student_id":    student_id,
@@ -535,7 +545,8 @@ async def get_student_context(
         key=lambda x: -x["mastery"],
     )[:8]
 
-    recent = rows[:8]
+    # Recent = directly observed only (inferred KST nodes have attempts=0)
+    recent = [r for r in rows if (r.get("attempts") or 0) > 0][:8]
 
     grade_breakdown: dict[str, dict] = {}
     for r in rows:
@@ -605,7 +616,7 @@ def _build_system_from_mastery(
     grade_bk  = ctx.get("grade_breakdown", {})
 
     gap_lines = [
-        f"  • {g['code']}: {g['description']} | mastery {round(g['mastery']*100)}%"
+        f"  • {g['code']} [node:{g.get('identifier','')}]: {g['description']} | mastery {round(g['mastery']*100)}%"
         for g in gaps[:8]
     ]
     strength_lines = [
@@ -650,6 +661,18 @@ def _build_system_from_mastery(
         "- You may use **bold**, bullet points, and numbered lists for clarity.",
         "- If the student has no history yet, encourage them to take an assessment to unlock personalised guidance.",
         "- If asked about a standard not in the student's history, still explain it clearly and say it hasn't been assessed yet.",
+        "",
+        "=== EXERCISE REFERRAL (IMPORTANT) ===",
+        "When the student asks to practice, wants exercises, or when you determine hands-on practice would help,",
+        "append this EXACT marker on a NEW LINE at the very end of your response (after all other text):",
+        '[[PRACTICE_ACTION: {"node_identifier": "<node_id_from_gap>", "standard_code": "<code>", "concept": "<short concept name>"}]]',
+        "Rules for the marker:",
+        "- Only emit it when practice exercises are genuinely appropriate (student asks for practice, or is stuck).",
+        "- Use the node_identifier from the [node:...] values in the KNOWLEDGE GAPS section above.",
+        "- If the student mentions a specific gap, use that gap's node_identifier and code.",
+        "- If multiple gaps are relevant, pick the single most important one.",
+        "- If no node_identifier is available (standard not in gaps list), omit the marker entirely.",
+        "- Do NOT emit the marker for general questions or explanations — only for practice referrals.",
     ]
 
     return "\n".join(sections)
@@ -1252,8 +1275,13 @@ async def standalone_tutor(body: StandaloneTutorRequest) -> dict[str, Any]:
     """
     Free-form AI tutor backed by the student's real-time mastery profile from Neo4j.
     Uses Gemini 2.5 Pro. Does not require a completed assessment — works any time.
+
+    The response may include an `action` field when the AI decides the student
+    should practice a specific concept. The frontend renders a "Start Exercises"
+    card that navigates to /exercises with the relevant parameters.
     """
     import asyncio
+    import json
     from backend.app.agents.vertex_llm import get_llm
 
     system_prompt = _build_system_from_mastery(
@@ -1268,7 +1296,7 @@ async def standalone_tutor(body: StandaloneTutorRequest) -> dict[str, Any]:
     loop = asyncio.get_event_loop()
 
     try:
-        response: str = await loop.run_in_executor(
+        raw_response: str = await loop.run_in_executor(
             None,
             lambda: llm.chat(
                 system=system_prompt,
@@ -1277,13 +1305,43 @@ async def standalone_tutor(body: StandaloneTutorRequest) -> dict[str, Any]:
                 model=CHAT_MODEL,
             ),
         )
-        if not response or not response.strip():
+        if not raw_response or not raw_response.strip():
             raise ValueError("Empty response from model")
-        return {
-            "role":    "assistant",
-            "content": response.strip(),
-            "model":   CHAT_MODEL,
-        }
     except Exception as exc:
         logger.error(f"Standalone tutor failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+    # ── Parse optional [[PRACTICE_ACTION: {...}]] marker ─────────────────────
+    action: dict | None = None
+    clean_response = raw_response.strip()
+
+    action_match = re.search(
+        r'\[\[PRACTICE_ACTION:\s*(\{[^}]+\})\]\]',
+        clean_response,
+        re.DOTALL,
+    )
+    if action_match:
+        try:
+            action_data = json.loads(action_match.group(1))
+            if action_data.get("node_identifier") and action_data.get("standard_code"):
+                action = {
+                    "type":            "start_exercises",
+                    "node_identifier": action_data["node_identifier"],
+                    "standard_code":   action_data["standard_code"],
+                    "concept":         action_data.get("concept", action_data["standard_code"]),
+                }
+                logger.info(
+                    f"Standalone tutor: PRACTICE_ACTION for "
+                    f"{action['standard_code']} ({body.student_id})"
+                )
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.warning(f"Failed to parse PRACTICE_ACTION marker: {exc}")
+        # Strip the marker from the visible message
+        clean_response = clean_response[:action_match.start()].strip()
+
+    return {
+        "role":    "assistant",
+        "content": clean_response,
+        "action":  action,
+        "model":   CHAT_MODEL,
+    }

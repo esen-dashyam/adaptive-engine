@@ -216,9 +216,15 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
     )
 
     # ── Cognitive Load Pruning ────────────────────────────────────────────────
-    # For every hard-blocked node, write TEMPORARY_BLOCK relationships to all
-    # downstream nodes so select_standards_irt cannot surface them next session.
     newly_blocked = _prune_downstream_nodes(state.student_id, hard_blocked)
+
+    # ── Persist KST-inferred masteries to Neo4j ───────────────────────────────
+    # KST propagates mastery signals to untested-but-related nodes in memory,
+    # but those inferences are never written to SKILL_STATE, so the AI tutor's
+    # flat MATCH query sees only directly tested nodes.
+    # We write the inferred values now so the tutor can reference them.
+    directly_tested = {r.get("node_ref", "") for r in state.results if r.get("node_ref")}
+    _persist_kst_inferences(state.student_id, knowledge_state, directly_tested)
 
     return {
         "gaps": gaps,
@@ -228,12 +234,103 @@ def identify_and_rank_gaps(state: AssessmentState) -> dict:
     }
 
 
+def _persist_kst_inferences(
+    student_id: str,
+    knowledge_state: dict[str, float],
+    directly_tested: set[str],
+    max_writes: int = 80,
+) -> None:
+    """
+    Write KST-inferred masteries to Neo4j SKILL_STATE edges so the AI Tutor's
+    flat MATCH query can surface related concepts the student was never directly
+    tested on.
+
+    Rules:
+    - Skip nodes that already have a directly-observed SKILL_STATE (from update_bkt).
+      We never overwrite real evidence with an inference.
+    - Skip nodes with no statementCode / description (orphaned nodes).
+    - Mark inferred edges with `inferred=true, source='kst'` so future code can
+      distinguish them from direct observations.
+    - If a node already has an inferred SKILL_STATE, update its mastery.
+    - Capped at `max_writes` nodes (50 lowest-mastery gaps + 30 highest strengths)
+      to avoid bulk-writing thousands of propagated nodes.
+    """
+    # Separate inferred nodes into gaps (low mastery) and strengths (high mastery)
+    inferred = [
+        (nid, m) for nid, m in knowledge_state.items()
+        if nid not in directly_tested
+    ]
+    if not inferred:
+        return
+
+    # Prioritise: lowest mastery first (most important gaps), then highest mastery
+    gaps_inf     = sorted([(n, m) for n, m in inferred if m < 0.55], key=lambda x: x[1])[:50]
+    strengths_inf = sorted([(n, m) for n, m in inferred if m >= 0.70], key=lambda x: -x[1])[:30]
+    to_write = gaps_inf + strengths_inf
+
+    if not to_write:
+        return
+
+    driver = _neo4j()
+    try:
+        with driver.session() as neo:
+            from datetime import datetime
+            now_str = datetime.utcnow().isoformat()
+
+            # Batch write — only touch nodes that have a real statementCode.
+            # ON MATCH only updates if the existing edge is itself inferred
+            # (inferred=true), so direct observations are never overwritten.
+            neo.run(
+                """
+                UNWIND $items AS item
+                MATCH (n:StandardsFrameworkItem {identifier: item.nid})
+                WHERE n.statementCode IS NOT NULL AND n.description IS NOT NULL
+                MERGE (s:Student {id: $sid})
+                MERGE (s)-[r:SKILL_STATE]->(n)
+                ON CREATE SET
+                    r.p_mastery   = item.mastery,
+                    r.inferred    = true,
+                    r.source      = 'kst',
+                    r.attempts    = 0,
+                    r.correct     = 0,
+                    r.last_updated = $now
+                ON MATCH SET
+                    r.p_mastery   = CASE WHEN coalesce(r.inferred, false) = true
+                                         THEN item.mastery ELSE r.p_mastery END,
+                    r.last_updated = CASE WHEN coalesce(r.inferred, false) = true
+                                         THEN $now ELSE r.last_updated END
+                """,
+                sid=student_id,
+                items=[{"nid": nid, "mastery": round(m, 3)} for nid, m in to_write],
+                now=now_str,
+            )
+
+        logger.info(
+            f"KST persistence: wrote {len(to_write)} inferred SKILL_STATE edges "
+            f"for student {student_id} "
+            f"({len(gaps_inf)} gaps, {len(strengths_inf)} strengths)"
+        )
+    except Exception as exc:
+        logger.warning(f"KST inference persistence failed (non-fatal): {exc}")
+    finally:
+        driver.close()
+
+
+BLOCK_STRIKE_THRESHOLD = 3   # consecutive hard-failures before TEMPORARY_BLOCK is applied
+
+
 def _prune_downstream_nodes(student_id: str, hard_blocked_ids: list[str]) -> list[str]:
     """
     For each hard-blocked node, find its downstream nodes (up to 4 hops via
     BUILDS_TOWARDS / PRECEDES) and create a
         (:Student)-[:TEMPORARY_BLOCK {blocked_by, created_at}]->(:StandardsFrameworkItem)
     relationship so the IRT selector skips them in future sessions.
+
+    Three-strike rule: a TEMPORARY_BLOCK is only written after the student has
+    failed the same high-weight prerequisite BLOCK_STRIKE_THRESHOLD (3) separate
+    times.  This prevents a single hallucinated question from locking the student
+    out of an entire module.  The failure_streak counter lives on the SKILL_STATE
+    edge and resets to 0 when mastery crosses the unblock threshold (≥ 0.65).
 
     Returns the list of newly-blocked node identifiers.
     """
@@ -248,7 +345,37 @@ def _prune_downstream_nodes(student_id: str, hard_blocked_ids: list[str]) -> lis
             now_str = datetime.utcnow().isoformat()
 
             for blocker_nid in hard_blocked_ids:
-                # Find all downstream nodes
+                # ── Three-strike check ────────────────────────────────────────
+                streak_row = neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->
+                          (n:StandardsFrameworkItem {identifier: $nid})
+                    RETURN coalesce(sk.failure_streak, 0) AS streak
+                    """,
+                    sid=student_id, nid=blocker_nid,
+                ).single()
+                current_streak = int(
+                    streak_row["streak"] if streak_row and streak_row["streak"] is not None else 0
+                ) + 1
+
+                # Persist the updated streak (SKILL_STATE must already exist from BKT update)
+                neo.run(
+                    """
+                    MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->
+                          (n:StandardsFrameworkItem {identifier: $nid})
+                    SET sk.failure_streak = $streak
+                    """,
+                    sid=student_id, nid=blocker_nid, streak=current_streak,
+                )
+
+                if current_streak < BLOCK_STRIKE_THRESHOLD:
+                    logger.info(
+                        f"Three-strike: [{blocker_nid}] strike {current_streak}/"
+                        f"{BLOCK_STRIKE_THRESHOLD} — downstream not yet blocked"
+                    )
+                    continue
+
+                # ── Strike threshold reached — apply TEMPORARY_BLOCK ──────────
                 result = neo.run(
                     """
                     MATCH (blocker:StandardsFrameworkItem {identifier: $nid})
@@ -264,7 +391,6 @@ def _prune_downstream_nodes(student_id: str, hard_blocked_ids: list[str]) -> lis
                 if not downstream_ids:
                     continue
 
-                # Write TEMPORARY_BLOCK relationships (MERGE so idempotent)
                 neo.run(
                     """
                     MATCH (s:Student {id: $sid})
@@ -272,19 +398,23 @@ def _prune_downstream_nodes(student_id: str, hard_blocked_ids: list[str]) -> lis
                     MATCH (n:StandardsFrameworkItem {identifier: did})
                     MERGE (s)-[b:TEMPORARY_BLOCK]->(n)
                     ON CREATE SET b.blocked_by  = $blocker,
-                                  b.created_at  = $now
+                                  b.created_at  = $now,
+                                  b.strike_count = $strikes
                     ON MATCH  SET b.blocked_by  = $blocker,
-                                  b.updated_at  = $now
+                                  b.updated_at  = $now,
+                                  b.strike_count = $strikes
                     """,
                     sid=student_id,
                     downstream_ids=downstream_ids,
                     blocker=blocker_nid,
                     now=now_str,
+                    strikes=current_streak,
                 )
                 newly_blocked.extend(downstream_ids)
                 logger.info(
                     f"Pruning: blocked {len(downstream_ids)} downstream nodes "
-                    f"from hard-block [{blocker_nid}] for student {student_id}"
+                    f"from hard-block [{blocker_nid}] (strike {current_streak}) "
+                    f"for student {student_id}"
                 )
 
     except Exception as exc:

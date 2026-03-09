@@ -12,17 +12,24 @@ Key formulas:
   Fisher Information I(θ) = P * (1 - P)           — maximised when θ ≈ β
   θ update (MLE gradient step): θ += (correct - P) / I(θ)
 
-Grade → difficulty mapping (logit scale):
-  Grade K  → -3.0   (very easy)
-  Grade 1  → -2.0
-  Grade 2  → -1.5
+β is anchored deterministically to (grade, DOK) metadata — not guessed.
+The matrix ensures θ estimation stays stable even when LLM-generated
+questions deviate slightly from their intended DOK level.
+
+Grade base (DOK 1 anchor):
+  Grade K  → -3.0   Grade 4  → -0.5   Grade 7  → +1.0
+  Grade 1  → -2.0   Grade 5  →  0.0   Grade 8  → +1.5
+  Grade 2  → -1.5   Grade 6  → +0.5   Grade 9+ → +2.0
   Grade 3  → -1.0
-  Grade 4  → -0.5
-  Grade 5  →  0.0   (average adult)
-  Grade 6  →  0.5
-  Grade 7  →  1.0
-  Grade 8  →  1.5
-  Grade 9+ →  2.0
+
+DOK offset (additive, grade-independent):
+  DOK 1 (Recall)             → +0.0
+  DOK 2 (Skill/Concept)      → +1.0
+  DOK 3 (Strategic Thinking) → +2.0
+  DOK 4 (Extended Thinking)  → +3.0
+
+Examples: Grade 3 DOK 1 → −1.0, Grade 3 DOK 2 → 0.0, Grade 3 DOK 3 → +1.0
+β is clamped to [−3.5, +3.5].
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ GRADE_DIFFICULTY: dict[str, float] = {
     "5":   0.0, "6":  0.5, "7":  1.0, "8":  1.5, "9":  2.0,
 }
 
-DOK_OFFSET: dict[int, float] = {1: -0.5, 2: 0.0, 3: 0.5, 4: 1.0}
+DOK_OFFSET: dict[int, float] = {1: 0.0, 2: 1.0, 3: 2.0, 4: 3.0}
 
 THETA_MIN = -4.0
 THETA_MAX =  4.0
@@ -83,18 +90,23 @@ def grade_to_difficulty(grade: str, dok_level: int = 2, category: str = "target"
     """
     Convert a grade string + DOK level to a Rasch difficulty logit (β).
 
-    'prerequisite' questions are one grade easier than target questions.
+    β is anchored deterministically to graph metadata — not guessed by the LLM.
+    DOK level is required by the question-generation prompt, so even slight
+    hallucinations keep the θ estimation stable.
+
+    'prerequisite' questions are one full grade-step easier (−0.5 logit).
+    β is clamped to [−3.5, +3.5] to stay within the IRT logit range.
     """
     if not grade:
         return 0.0
-    key = str(grade).lower().replace("k", "k").strip()
+    key = str(grade).lower().strip()
     if key.startswith("k"):
         key = "k"
     base = GRADE_DIFFICULTY.get(key, 0.0)
     if category == "prerequisite":
         base -= 0.5
-    base += DOK_OFFSET.get(dok_level, 0.0)
-    return round(base, 2)
+    base += DOK_OFFSET.get(dok_level, 1.0)   # DOK 2 is the default
+    return round(max(-3.5, min(3.5, base)), 2)
 
 
 # ── Session-level estimator ────────────────────────────────────────────────────

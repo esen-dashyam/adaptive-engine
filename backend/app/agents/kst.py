@@ -39,8 +39,19 @@ HARD_PREREQ_THRESHOLD  = 0.9
 SOFT_PREREQ_THRESHOLD  = 0.5
 HARD_BLOCK_MASTERY     = 0.05   # mastery assigned when hard-blocked
 SUCCESS_DECAY          = 0.90   # how much mastery propagates downward per hop
-FAILURE_DECAY          = 0.70   # how much failure propagates upward per hop
-MAX_PROPAGATION_HOPS   = 3
+
+# Depth-limited attenuation: penalty runs out of steam as it travels up the graph.
+# Flat multiplicative decay (× 0.70) would cascade through a 144k-node graph and
+# wipe out whole grade levels from a single failed question. Instead we subtract an
+# absolute penalty that shrinks with hop distance and stops entirely at h=2.
+#
+#   Penalty(h) = BASE_FAIL_PENALTY / log2(h + 1)
+#   h=1 (direct parent):      0.15 / 1.000 = 0.150
+#   h=2 (grandparent):        0.15 / 1.585 ≈ 0.095  → hard stop after this
+#
+# This isolates damage to immediate context while still registering a diagnostic signal.
+BASE_FAIL_PENALTY    = 0.15    # logit-scale mastery subtracted at h=1
+MAX_PROPAGATION_HOPS = 2       # hard stop: failure never travels beyond grandparent
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -94,13 +105,13 @@ def build_knowledge_state(
     for nid in list(passed):
         _propagate_success(nid, state, parents_of, SUCCESS_DECAY, MAX_PROPAGATION_HOPS)
 
-    # 4. Failure propagation — upward (to advanced / dependent concepts)
+    # 4. Failure propagation — upward (to advanced / dependent concepts).
+    # Uses depth-limited attenuation: penalty halves every hop and stops at h=2
+    # to prevent a single failure cascading through the entire 144k-node graph.
     failed = {nid for nid, m in state.items() if m < 0.4}
     hard_blocked: list[str] = []
     for nid in list(failed):
-        blocked = _propagate_failure(
-            nid, state, children_of, FAILURE_DECAY, MAX_PROPAGATION_HOPS
-        )
+        blocked = _propagate_failure(nid, state, children_of, hop_depth=1)
         hard_blocked.extend(blocked)
 
     # 5. Apply misconception penalties
@@ -173,29 +184,40 @@ def _propagate_failure(
     node_id: str,
     state: dict[str, float],
     children_of: dict[str, list[tuple[str, float]]],
-    decay: float,
-    hops: int,
+    hop_depth: int,
 ) -> list[str]:
     """
-    Propagate failure upward (toward advanced concepts).
+    Propagate failure upward (toward advanced concepts) with depth-limited attenuation.
+
+    Penalty at hop h: BASE_FAIL_PENALTY / log2(h + 1)
+      h=1 (direct parent):  0.15 logit units
+      h=2 (grandparent):   ~0.09 logit units
+      h>2:                  stop — no further propagation
+
+    Hard prerequisites (weight ≥ 0.9) set the child to HARD_BLOCK_MASTERY
+    regardless of hop depth, but subsequent hops from that child still obey
+    the depth limit.
+
     Returns list of hard-blocked node IDs.
     """
+    import math
     hard_blocked = []
-    if hops <= 0:
+    if hop_depth > MAX_PROPAGATION_HOPS:
         return hard_blocked
 
-    current_mastery = state.get(node_id, 0.3)
+    penalty = BASE_FAIL_PENALTY / math.log2(hop_depth + 1)
+
     for child_id, weight in children_of.get(node_id, []):
         if weight >= HARD_PREREQ_THRESHOLD:
             state[child_id] = HARD_BLOCK_MASTERY
             hard_blocked.append(child_id)
             hard_blocked.extend(
-                _propagate_failure(child_id, state, children_of, decay, hops - 1)
+                _propagate_failure(child_id, state, children_of, hop_depth + 1)
             )
         elif weight >= SOFT_PREREQ_THRESHOLD:
-            penalised = current_mastery * decay
+            penalised = max(0.01, state.get(child_id, 0.5) - penalty)
             if penalised < state.get(child_id, 1.0):
                 state[child_id] = penalised
-                _propagate_failure(child_id, state, children_of, decay * 0.8, hops - 1)
+                _propagate_failure(child_id, state, children_of, hop_depth + 1)
 
     return hard_blocked

@@ -51,11 +51,17 @@ _BOUNDS = {
     "p_guess":   (0.10, 0.45),  # below 0.10 means always guessing wrong
 }
 
-# Default params used before any fitting (same across both BKT users)
-DEFAULT_P_INIT     = 0.10
-DEFAULT_P_TRANSIT  = 0.10
-DEFAULT_P_SLIP     = 0.08
-DEFAULT_P_GUESS    = 0.25
+# Default params used before any fitting (single source of truth for all BKT callers).
+# Import these constants instead of hardcoding local values to keep the system
+# consistent and to prevent silent parameter drift across modules.
+DEFAULT_P_INIT     = 0.10   # prior probability of knowing a skill before any evidence
+DEFAULT_P_TRANSIT  = 0.10   # per-attempt learning rate during formal assessments
+DEFAULT_P_SLIP     = 0.08   # P(wrong | mastered) — slip rate
+DEFAULT_P_GUESS    = 0.25   # P(correct | not mastered) — lucky-guess rate
+
+# Exercises allow a faster learning rate than formal assessments because the
+# student is in a low-stakes, targeted practice context.
+EXERCISE_P_TRANSIT = 0.20
 
 
 @dataclass
