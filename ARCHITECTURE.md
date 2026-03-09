@@ -26,8 +26,13 @@ Next.js Frontend (localhost:3000)
     │  POST /api/v1/assessment/evaluate        Phase B: full 20-node pipeline
     │  POST /api/v1/assessment/exercise_complete   live exercise BKT update + EMA
     │  POST /api/v1/assessment/exercise_chat   live chat → φ signal → recursive pivot
+    │  POST /api/v1/exercises/generate         on-demand targeted exercise set
+    │  GET  /api/v1/exercises/queue/{id}       gap-based practice queue
     │  POST /api/v1/chat/tutor                 post-assessment AI Tutor
-    │  POST /api/v1/chat/standalone            always-on AI Tutor
+    │  POST /api/v1/chat/standalone            always-on AI Tutor (intent detection + strategy escalation)
+    │  POST /api/v1/chat/confirm_action        confirm pending BKT action from tutor
+    │  POST /api/v1/chat/parent               parent/teacher summary query
+    │  POST /api/v1/chat/parent_summary       generate full parent progress report
     │  GET  /api/v1/chat/context/{id}          load mastery profile
     │
     ▼
@@ -36,7 +41,8 @@ FastAPI Backend (localhost:8000)
     ├─ Phase A LangGraph (4 nodes) ──────────► Neo4j KG + Gemini Flash
     ├─ Phase B LangGraph (20 nodes) ─────────► Neo4j KG + Gemini Flash + Postgres
     ├─ exercise_chat endpoint ───────────────► Neo4j + Gemini Flash (real-time)
-    └─ AI Tutor (chat.py) ───────────────────► Neo4j KG + Gemini 2.5 Pro
+    ├─ exercises router ─────────────────────► Neo4j + Gemini Flash (on-demand)
+    └─ AI Tutor (chat.py) ───────────────────► Neo4j KG + Gemini 2.5 Pro + Postgres
 ```
 
 ---
@@ -348,6 +354,165 @@ Frontend sends:
 
 ---
 
+## AI Tutor Chat System
+
+The always-on AI Tutor (`POST /chat/standalone`) runs independently of the assessment pipeline. It loads the student's live mastery profile from Neo4j and maintains working memory in Postgres `chat_sessions`.
+
+### Intent Detection (5 rules, evaluated in order)
+
+| Priority | Intent | Trigger | Tutor Action |
+|---|---|---|---|
+| 1 | `CONFUSION` | "I don't get", "I'm lost", "help", "confused" keywords | LCA lookup → bridge instruction |
+| 2 | `EXERCISE_REQUEST` | "practice", "exercise", "drill", "try one" | Emit `[[PRACTICE_ACTION]]` marker |
+| 3 | `CONCEPT_QUERY` | "what is", "explain", "how does" | Pedagogical explanation at current strategy level |
+| 4 | `PROGRESS_CHECK` | "how am I doing", "what should I learn" | Neo4j mastery summary + ZPD frontier |
+| 5 | `GENERAL` | fallback | Free-form tutoring with context injection |
+
+### Session Working Memory (Postgres `chat_sessions`)
+
+One row per student, upserted on each interaction. Persists strategy state across browser sessions.
+
+```
+student_id            — unique key
+current_node_id       — Neo4j node currently in focus (set when student asks about a specific concept)
+current_node_code     — standard code (e.g. "5.NF.A.1")
+pedagogical_strategy  — "socratic" | "visual" | "cra"
+consecutive_struggles — counter; resets to 0 on any correct/positive signal
+last_message_at       — used for silence detection (> 120s between messages)
+```
+
+### Pedagogical Strategy Escalation
+
+```
+consecutive_struggles:
+  0–1  → Socratic   (ask guiding questions, let student discover)
+  2–3  → Visual     (use diagrams, number lines, concrete representations)
+  4+   → CRA        (Concrete → Representational → Abstract; explicit worked examples)
+
+Strategy resets to Socratic when student demonstrates understanding (φ ≥ 0.5 or explicit "I get it").
+```
+
+### `[[PRACTICE_ACTION]]` Marker
+
+When the tutor decides the student needs practice, Gemini emits a structured marker in its response text:
+
+```json
+[[PRACTICE_ACTION: {
+  "node_identifier": "...",
+  "standard_code": "5.NF.A.1",
+  "concept": "Adding fractions with unlike denominators",
+  "grade": "K5",
+  "subject": "math"
+}]]
+```
+
+The frontend (`tutor/page.tsx`) detects this marker, strips it from the visible message, and renders an exercise referral card with a "Start Practice" button. Clicking the button navigates to `/exercises?node=...&code=...` which calls `POST /exercises/generate`.
+
+### LCA-Grounded Bridge (CONFUSION intent)
+
+When CONFUSION is detected, the tutor:
+1. Calls `find_lca(driver, student_id, node_identifier)` — BFS backward through `BUILDS_TOWARDS` (up to 6 hops) to find nearest mastered ancestor (p_mastery ≥ 0.95)
+2. Injects anchor concept into the system prompt: "Student already understands {anchor_code}: {anchor_description}"
+3. Gemini generates a bridge: "Great news — you already know {anchor}! Let's build from there to understand {target}."
+
+### Pending BKT Confirmation (`POST /chat/confirm_action`)
+
+Some tutor actions (e.g. adjusting a mastery estimate based on chat evidence) require explicit confirmation before writing to Neo4j. The tutor emits an `[[EVAL_JSON: {...}]]` marker with proposed mastery updates. The frontend renders a confirmation card. When the student or teacher confirms, `POST /chat/confirm_action` applies the BKT write.
+
+---
+
+## Continuous Gap-Based Practice System
+
+### Sub-skill Gap Detection and Persistence
+
+Every `POST /assessment/exercise_chat` call runs the Dynamic Weight Auditor (Gemini), which returns a `gap_tag` — a specific sub-skill label describing where the student is stuck (e.g. "regrouping", "denominator vs numerator", "place value").
+
+**Persistence loop:**
+
+```
+exercise_chat response
+  └── gap_tag: "denominator vs numerator"
+        │
+        ▼
+  _do_bkt() in assessment.py (atomic with BKT write)
+        │
+        Cypher CASE expression:
+          IF gap_tags IS NULL     → SET gap_tags = [tag]
+          IF tag IN gap_tags      → no change (deduplicate)
+          IF size >= 5            → SET gap_tags = tail(gap_tags) + [tag]  (LIFO cap)
+          ELSE                    → SET gap_tags = gap_tags + [tag]
+        │
+        ▼
+  SKILL_STATE.gap_tags (list[str], max 5, deduped, LIFO)
+```
+
+### Gap-Targeted Exercise Generation
+
+When `POST /exercises/generate` is called, `_fetch_student_context()` reads `gap_tags` alongside p_mastery. The generation prompt includes a `CRITICAL` block:
+
+```
+Detected sub-skill gaps from live practice monitoring:
+  • denominator vs numerator (flagged 3x)
+  • equivalent fractions
+
+CRITICAL: Your exercises MUST specifically target these sub-skills.
+Each exercise should directly address at least one of these gaps.
+Do NOT generate generic exercises — the student is stuck on these exact sub-skills.
+```
+
+Frequency weighting (`Counter(gap_tags)`) ensures the most-flagged sub-skills are listed first and annotated with their repetition count.
+
+### Practice Queue (`GET /exercises/queue/{student_id}`)
+
+Returns a priority-ordered list of the student's knowledge gaps as ready-to-launch exercise cards.
+
+**Priority ordering:**
+
+```
+1. Hard-blocked first (failure_streak ≥ 3 on SKILL_STATE edge)
+2. Downstream impact (count of concepts blocked by this gap, via PRECEDES/BUILDS_TOWARDS *1..3 hops)
+3. Lowest mastery
+```
+
+**Re-assessment readiness signal:**
+
+```
+ready_for_reassessment = True
+  when: student has ≥ 3 skills where
+    SKILL_STATE.p_mastery ≥ 0.65 AND SKILL_STATE.attempts ≥ 2
+    (i.e. multiple real improvements, not just initial estimates)
+```
+
+### Live Gap Strip (Frontend)
+
+During an exercise session (`exercises/page.tsx`), gap_tags returned by `exercise_chat` are accumulated in React state and rendered as an amber badge strip:
+
+```
+Targeting your specific gaps
+  [denominator vs numerator]  [regrouping]  [place value]
+
+Next exercise set will be built around these sub-skills until you master them.
+```
+
+Badges are deduplicated and capped at 5 (most recent). They disappear when the student generates a new exercise set after mastery rises above 0.55 (the concept falls off the practice queue).
+
+### "Until the Kid Learns" Mastery Loop
+
+```
+exercise_chat (live session)
+  → gap_tag persisted to SKILL_STATE.gap_tags
+  → φ-modified BKT updates p_mastery
+  → if p_mastery ≥ 0.55: concept exits practice queue
+  → if p_mastery < 0.55: next /exercises/generate call reads gap_tags
+                          and generates exercises that target exact sub-skills
+
+Concept re-enters queue if mastery drops below 0.55 in a future session.
+Gap tags are overwritten over time — stale gaps are naturally LIFO-evicted
+as new practice sessions produce fresh diagnostic signals.
+```
+
+---
+
 ## The φ-Modified BKT Formula
 
 ### Standard BKT (old)
@@ -499,13 +664,23 @@ p_before_adj = max(0.05, p_before - misconception_penalty)
 ### Knowledge Space Theory — KST (`agents/kst.py`)
 
 ```
-SUCCESS_DECAY  = 0.90   per hop downward (toward prereqs)
-FAILURE_DECAY  = 0.70   per hop upward (toward advanced concepts)
-MAX_HOPS       = 3
-HARD_PREREQ_THRESHOLD  = 0.9   (edge weight ≥ 0.9 → hard block)
+SUCCESS_DECAY          = 0.90   per hop downward (toward prereqs)
+BASE_FAIL_PENALTY      = 0.15   logit-scale mastery subtracted at h=1
+MAX_PROPAGATION_HOPS   = 2      hard stop: failure never travels beyond grandparent
+HARD_PREREQ_THRESHOLD  = 0.9    (edge weight ≥ 0.9 → hard block)
 HARD_BLOCK_MASTERY     = 0.05
-MASTERY_GAP_THRESHOLD  = 0.55  (below this = gap)
+MASTERY_GAP_THRESHOLD  = 0.55   (below this = gap)
 ```
+
+Failure propagation uses depth-limited attenuation (not flat multiplicative decay):
+```
+Penalty(h) = BASE_FAIL_PENALTY / log2(h + 1)
+  h=1 (direct parent):   0.15 / 1.000 = 0.150
+  h=2 (grandparent):     0.15 / 1.585 ≈ 0.095
+  h>2:                   stop — no further propagation
+```
+
+This isolates failure damage to the immediate context while still registering a diagnostic signal. Flat multiplicative decay at 0.70 would cascade through the entire 144K-node graph from a single failed question.
 
 After a ~10-question assessment, only ~10 of 144K nodes are directly observed. KST fills in the rest by propagating signals through the `BUILDS_TOWARDS`/`PRECEDES` graph. `identify_frontier()` finds the ZPD: unmastered nodes whose ALL prerequisites ARE mastered.
 
@@ -599,7 +774,7 @@ new_weight = old_weight * 0.95 + signal * 0.05
 
 | Relationship | Connects | Properties |
 |---|---|---|
-| `SKILL_STATE` | `Student → StandardsFrameworkItem` | `p_mastery`, `p_slip`, `p_guess`, `p_transit`, `attempts`, `correct`, `last_updated`, `fidelity_factor` |
+| `SKILL_STATE` | `Student → StandardsFrameworkItem` | `p_mastery`, `p_slip`, `p_guess`, `p_transit`, `attempts`, `correct`, `last_updated`, `fidelity_factor`, `gap_tags` (list[str], max 5 LIFO-deduped sub-skill gaps), `failure_streak` (consecutive wrong answers, resets on correct) |
 | `TEMPORARY_BLOCK` | `Student → StandardsFrameworkItem` | `blocked_by` (node_identifier that caused block), `created_at`, `updated_at` |
 | `ATTEMPTED` | `Student → GeneratedQuestion` | `correct`, `selected_answer`, `correct_answer`, `timestamp`, `session_id` |
 
@@ -674,8 +849,18 @@ One row per student, upserted on each tutor interaction:
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/tutor` | Multi-turn chat grounded in full EvalResult (Gemini 2.5 Pro) |
-| `POST` | `/standalone` | Multi-turn chat grounded in live Neo4j mastery |
+| `POST` | `/standalone` | Multi-turn chat grounded in live Neo4j mastery; intent detection + strategy escalation |
+| `POST` | `/confirm_action` | Confirm pending BKT action (e.g. exercise referral) proposed by tutor |
+| `POST` | `/parent` | Parent/teacher query about a student's progress |
+| `POST` | `/parent_summary` | Generate structured full progress report for parent |
 | `GET` | `/context/{student_id}` | Load structured mastery profile for standalone tutor |
+
+### Exercises (`/api/v1/exercises/`)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/generate` | Generate 3 targeted practice exercises for a specific standard; personalised to θ, p_mastery, prior history, and persisted gap_tags |
+| `GET` | `/queue/{student_id}` | Priority-ordered gap-based practice queue; includes re-assessment readiness signal |
 
 ---
 
@@ -854,7 +1039,8 @@ adaptive-learning-engine/
 │       │   └── vertex_llm.py          ← VertexLLM: generate, generate_json, chat
 │       ├── api/routes/
 │       │   ├── assessment.py          ← /generate, /evaluate, /exercise_complete, /exercise_chat
-│       │   └── chat.py                ← /tutor, /standalone, /context
+│       │   ├── exercises.py           ← /exercises/generate, /exercises/queue/{id}
+│       │   └── chat.py                ← /tutor, /standalone, /confirm_action, /parent, /parent_summary, /context
 │       ├── student/
 │       │   ├── bkt_fitter.py          ← Baum-Welch EM for per-skill BKT parameter fitting
 │       │   ├── bayesian_tracker.py    ← BayesianSkillTracker (legacy, used by rasch route)
@@ -870,6 +1056,8 @@ adaptive-learning-engine/
 ├── frontend/
 │   └── app/
 │       ├── assessment/page.tsx        ← main assessment UI + AI Tutor chat
+│       ├── tutor/page.tsx             ← always-on AI Tutor (standalone chat, practice referral cards)
+│       ├── exercises/page.tsx         ← exercise session UI (gap strip, pivot cards, BKT updates)
 │       ├── dashboard/                 ← parent/teacher dashboard
 │       └── rasch/                     ← IRT diagnostic view
 ├── infra/
