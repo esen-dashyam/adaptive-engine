@@ -35,6 +35,15 @@ class AssessmentRequest(BaseModel):
         default="Multi-State",
         description="US state abbreviation (TX, CA, NY …) or 'Multi-State' for Common Core",
     )
+    # Retry mode: if provided, only ask questions on these specific standard codes
+    pinned_standard_codes: list[str] = Field(default_factory=list)
+
+
+class ParentFeedbackRequest(BaseModel):
+    student_id: str
+    assessment_id: str = ""
+    accurate: str = Field(..., description="'yes' | 'somewhat' | 'no'")
+    parent_notes: str = ""
 
 
 class AnswerSubmission(BaseModel):
@@ -142,6 +151,154 @@ async def _load_student_theta(student_id: str) -> float:
         return 0.0
 
 
+def _normalize_grade_token(grade: str) -> str:
+    token = str(grade or "").strip().upper()
+    if not token:
+        return "1"
+    if token == "K":
+        return "k"
+    if token.startswith("K") and token[1:].isdigit():
+        return token[1:]
+    if token.isdigit():
+        return token
+    return token.replace("K", "") or "1"
+
+
+async def _load_beta_anchors(answer_rows: list[dict[str, Any]], fallback_grade: str) -> dict[str, float]:
+    from neo4j import GraphDatabase
+
+    from backend.app.agents.rasch import grade_to_difficulty
+    from backend.app.core.settings import settings
+
+    fallback = _normalize_grade_token(fallback_grade)
+    node_ids = list({a.get("node_ref", "") for a in answer_rows if a.get("node_ref")})
+    grade_map: dict[str, str] = {}
+
+    if node_ids:
+        loop = asyncio.get_event_loop()
+
+        def _fetch() -> dict[str, str]:
+            driver = GraphDatabase.driver(
+                settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+            )
+            try:
+                with driver.session() as neo:
+                    rows = neo.run(
+                        """
+                        UNWIND $ids AS nid
+                        MATCH (n:StandardsFrameworkItem {identifier: nid})
+                        RETURN n.identifier AS nid, n.gradeLevelList AS grade_levels
+                        """,
+                        ids=node_ids,
+                    )
+                    return {
+                        r["nid"]: _normalize_grade_token((r["grade_levels"] or [fallback])[0])
+                        for r in rows
+                        if r["nid"]
+                    }
+            finally:
+                driver.close()
+
+        grade_map = await loop.run_in_executor(None, _fetch)
+
+    anchors: dict[str, float] = {}
+    for a in answer_rows:
+        qid = a.get("question_id", "")
+        if not qid:
+            continue
+        node_grade = grade_map.get(a.get("node_ref", ""), fallback)
+        anchors[qid] = grade_to_difficulty(
+            node_grade,
+            int(a.get("dok_level", 2) or 2),
+            a.get("category", "target"),
+        )
+    return anchors
+
+
+async def _bubble_mastery_forward(student_id: str, node_identifier: str, p_mastery: float) -> dict[str, Any]:
+    if p_mastery < 0.65 or not node_identifier:
+        return {"updated": 0, "nodes": []}
+
+    from datetime import datetime as _dt
+    from neo4j import GraphDatabase
+
+    from backend.app.core.settings import settings
+
+    loop = asyncio.get_event_loop()
+
+    def _run() -> dict[str, Any]:
+        driver = GraphDatabase.driver(
+            settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password)
+        )
+        try:
+            with driver.session() as neo:
+                rows = neo.run(
+                    """
+                    MATCH p=(src:StandardsFrameworkItem {identifier: $nid})
+                          -[rels:BUILDS_TOWARDS|PRECEDES*1..2]->
+                          (dst:StandardsFrameworkItem)
+                    WHERE dst.identifier <> $nid
+                    OPTIONAL MATCH (s:Student {id: $sid})-[sk:SKILL_STATE]->(dst)
+                    RETURN dst.identifier AS nid,
+                           [rel IN relationships(p) | coalesce(rel.conceptual_weight, rel.understanding_strength, 0.7)] AS weights,
+                           length(p) AS hops,
+                           coalesce(sk.p_mastery, 0.3) AS current_mastery
+                    """,
+                    sid=student_id,
+                    nid=node_identifier,
+                )
+
+                updates: list[dict[str, Any]] = []
+                for row in rows:
+                    path_weight = 1.0
+                    for weight in row["weights"] or []:
+                        path_weight *= float(weight or 0.7)
+                    hops = max(int(row["hops"] or 1), 1)
+                    candidate = min(0.95, float(p_mastery) * path_weight * (0.9 ** (hops - 1)))
+                    current_mastery = float(row["current_mastery"] or 0.3)
+                    if candidate <= current_mastery + 0.02:
+                        continue
+                    updates.append({
+                        "nid": row["nid"],
+                        "mastery": round(candidate, 4),
+                        "source": node_identifier,
+                    })
+
+                if not updates:
+                    return {"updated": 0, "nodes": []}
+
+                neo.run(
+                    """
+                    UNWIND $updates AS item
+                    MERGE (s:Student {id: $sid})
+                    MATCH (n:StandardsFrameworkItem {identifier: item.nid})
+                    MERGE (s)-[r:SKILL_STATE]->(n)
+                    SET r.p_mastery = CASE
+                            WHEN coalesce(r.p_mastery, 0.0) < item.mastery THEN item.mastery
+                            ELSE r.p_mastery
+                        END,
+                        r.inferred = CASE
+                            WHEN coalesce(r.attempts, 0) = 0 THEN true
+                            ELSE coalesce(r.inferred, false)
+                        END,
+                        r.source = CASE
+                            WHEN coalesce(r.attempts, 0) = 0 THEN 'exercise_bubble'
+                            ELSE coalesce(r.source, 'exercise_bubble')
+                        END,
+                        r.last_propagated_from = item.source,
+                        r.last_updated = $now
+                    """,
+                    sid=student_id,
+                    updates=updates,
+                    now=_dt.utcnow().isoformat(),
+                )
+                return {"updated": len(updates), "nodes": [u["nid"] for u in updates]}
+        finally:
+            driver.close()
+
+    return await loop.run_in_executor(None, _run)
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.post("/generate", summary="Generate an adaptive K1-K8 assessment")
@@ -170,6 +327,7 @@ async def generate_assessment(body: AssessmentRequest) -> dict[str, Any]:
             state_jurisdiction=body.state,
             theta=theta,
             phase="start",
+            pinned_standard_codes=body.pinned_standard_codes,
         )
 
         loop = asyncio.get_event_loop()
@@ -251,24 +409,36 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
         logger.info(f"  ▶ PHASE B START │ student={body.student_id}  grade={body.grade}  answers={len(body.answers)}")
         logger.info("═" * 60)
         theta = await _load_student_theta(body.student_id)
+        beta_anchors = await _load_beta_anchors(body.answers, body.grade)
 
-        # Reconstruct question list from submitted answers for Phase B
+        # Reconstruct question list from submitted answers for Phase B.
+        # Supports open-ended (rubric/answer_key) and legacy MC (options/answer).
         questions = [
             {
-                "id":           a.get("question_id", ""),
-                "question":     a.get("question", ""),
-                "options":      a.get("options", []),
-                "answer":       a.get("correct_answer", a.get("answer", "")),
-                "category":     a.get("category", "target"),
-                "dok_level":    a.get("dok_level", 2),
+                "id":            a.get("question_id", ""),
+                "question":      a.get("question", ""),
+                "rubric":        a.get("rubric", ""),
+                "answer_key":    a.get("answer_key", a.get("correct_answer", a.get("answer", ""))),
+                "type":          a.get("question_type", a.get("type", "open_ended")),
+                "options":       a.get("options", {}),
+                "answer":        a.get("correct_answer", a.get("answer", "")),
+                "category":      a.get("category", "target"),
+                "dok_level":     a.get("dok_level", 2),
                 "standard_code": a.get("standard_code", ""),
-                "node_ref":     a.get("node_ref", ""),
-                "beta":         a.get("beta", 0.0),
+                "node_ref":      a.get("node_ref", ""),
+                "beta":          beta_anchors.get(a.get("question_id", ""), a.get("beta", 0.0)),
             }
             for a in body.answers
         ]
         submitted = [
-            {"question_id": a.get("question_id", ""), "selected_answer": a.get("student_answer", "")}
+            {
+                "question_id":      a.get("question_id", ""),
+                # open-ended: student_response; MC: selected_answer
+                "student_response": a.get("student_response") or a.get("student_answer") or "",
+                "selected_answer":  a.get("selected_answer") or a.get("student_answer") or a.get("student_response") or "",
+                "time_ms":          float(a.get("time_ms", 0.0) or 0.0),
+                "chat_message":     a.get("chat_message", "") or "",
+            }
             for a in body.answers
         ]
 
@@ -299,6 +469,40 @@ async def evaluate_assessment(body: AnswerSubmission) -> dict[str, Any]:
         target_results  = [r for r in final.results if r.get("category") == "target"]
         prereq_score = sum(1 for r in prereq_results if r["is_correct"]) / max(len(prereq_results), 1)
         target_score  = sum(1 for r in target_results  if r["is_correct"]) / max(len(target_results), 1)
+
+        # ── Store last assessment snapshot on Student node for parent review ──
+        try:
+            import json as _json
+            from neo4j import GraphDatabase as _GDB
+            from backend.app.core.settings import settings as _cfg
+            _failed_codes = [
+                r.get("standard_code", "") for r in final.results
+                if not r.get("is_correct") and r.get("standard_code")
+            ]
+            _snapshot = {
+                "assessment_id":  body.assessment_id,
+                "score":          round(final.score, 3),
+                "total":          len(final.results),
+                "correct":        sum(1 for r in final.results if r["is_correct"]),
+                "grade":          body.grade,
+                "subject":        body.subject,
+                "failed_standard_codes": _failed_codes,
+                "failed_standards": [
+                    {"code": r.get("standard_code",""), "question": r.get("question","")[:120]}
+                    for r in final.results if not r.get("is_correct")
+                ],
+                "timestamp":      datetime.datetime.utcnow().isoformat(),
+            }
+            _drv = _GDB.driver(_cfg.neo4j_uri, auth=(_cfg.neo4j_user, _cfg.neo4j_password))
+            _drv.execute_query(
+                "MERGE (s:Student {id:$sid}) SET s.last_assessment = $snap, s.last_assessment_at = $ts",
+                sid=body.student_id,
+                snap=_json.dumps(_snapshot),
+                ts=_snapshot["timestamp"],
+            )
+            _drv.close()
+        except Exception as _snap_err:
+            logger.warning(f"Could not store assessment snapshot: {_snap_err}")
 
         if   final.score >= 0.85: grade_status = "above"
         elif final.score >= 0.70: grade_status = "at"
@@ -536,6 +740,7 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
         # If this exercise brought the blocking node above the mastery threshold,
         # clear TEMPORARY_BLOCK relationships for all nodes it was blocking.
         MASTERY_UNBLOCK_THRESHOLD = 0.65
+        bubble_result = {"updated": 0, "nodes": []}
         if result["p_mastery_after"] >= MASTERY_UNBLOCK_THRESHOLD:
             def _clear_blocks():
                 with driver.session() as neo:
@@ -565,6 +770,11 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
                     f"Unblocked {n_cleared} downstream nodes — "
                     f"student {body.student_id} mastered [{body.node_identifier}]"
                 )
+            bubble_result = await _bubble_mastery_forward(
+                body.student_id,
+                body.node_identifier,
+                float(result["p_mastery_after"]),
+            )
 
         driver.close()
 
@@ -578,6 +788,8 @@ async def submit_exercise_result(body: ExerciseResultRequest) -> dict[str, Any]:
             "student_id":       body.student_id,
             "standard_code":    body.standard_code,
             "correct":          body.correct,
+            "propagated_forward": bubble_result["updated"],
+            "propagated_nodes": bubble_result["nodes"],
             **result,
         }
 
@@ -1251,4 +1463,58 @@ async def student_trajectory(
         }
     except Exception as exc:
         logger.error(f"Trajectory report failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/student/{student_id}/last_result", summary="Get the last assessment result for parent review")
+async def get_last_result(student_id: str) -> dict[str, Any]:
+    """Return the stored snapshot from the most recent assessment for this student."""
+    import json as _json
+    try:
+        from neo4j import GraphDatabase
+        from backend.app.core.settings import settings
+
+        driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+        records, _, _ = driver.execute_query(
+            "MATCH (s:Student {id:$sid}) RETURN s.last_assessment AS snap, s.parent_accuracy_feedback AS feedback",
+            sid=student_id,
+        )
+        driver.close()
+
+        if not records or records[0]["snap"] is None:
+            return {"has_data": False}
+
+        snap = _json.loads(records[0]["snap"])
+        feedback_raw = records[0]["feedback"]
+        feedback = _json.loads(feedback_raw) if feedback_raw else None
+        return {"has_data": True, "snapshot": snap, "parent_feedback": feedback}
+    except Exception as exc:
+        logger.error(f"last_result failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/parent_feedback", summary="Parent confirms or disputes assessment accuracy")
+async def submit_parent_feedback(body: ParentFeedbackRequest) -> dict[str, Any]:
+    """Store parent's accuracy rating (yes/somewhat/no) + optional notes on the Student node."""
+    import json as _json
+    try:
+        from neo4j import GraphDatabase
+        from backend.app.core.settings import settings
+
+        payload = {
+            "accurate": body.accurate,
+            "notes": body.parent_notes,
+            "assessment_id": body.assessment_id,
+            "submitted_at": datetime.datetime.utcnow().isoformat(),
+        }
+        driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+        driver.execute_query(
+            "MERGE (s:Student {id:$sid}) SET s.parent_accuracy_feedback = $feedback",
+            sid=body.student_id,
+            feedback=_json.dumps(payload),
+        )
+        driver.close()
+        return {"status": "saved", "student_id": body.student_id, "accurate": body.accurate}
+    except Exception as exc:
+        logger.error(f"parent_feedback failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))

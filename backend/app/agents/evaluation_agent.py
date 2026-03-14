@@ -35,6 +35,12 @@ from backend.app.student.bkt_fitter import (
 )
 
 
+MAX_MASTERY_DROP_PER_CYCLE = 0.15
+MAX_LLM_PENALTY_PER_CYCLE = 0.10
+SE_REFERENCE = 0.30
+MIN_NEGATIVE_PHI_SCALE = 0.25
+
+
 def _bkt_update(
     p_mastery: float,
     correct: bool,
@@ -72,8 +78,25 @@ def _bkt_update(
     # Safety floor: a single LLM observation cannot erase more than 0.15 of
     # accumulated mastery. This prevents a mis-interpreted chat message from
     # wiping out weeks of student progress in one turn.
-    updated = max(p_mastery - 0.15, updated)
+    updated = max(p_mastery - MAX_MASTERY_DROP_PER_CYCLE, updated)
     return max(0.01, min(0.999, updated))
+
+
+def _cap_llm_penalty(penalty: float) -> float:
+    return max(0.0, min(MAX_LLM_PENALTY_PER_CYCLE, float(penalty)))
+
+
+def _dampen_negative_phi(phi: float, se: float | None) -> float:
+    phi = max(-1.0, min(1.0, float(phi)))
+    if phi >= 0.0:
+        return phi
+    se_value = max(SE_REFERENCE, float(se or SE_REFERENCE))
+    scale = max(MIN_NEGATIVE_PHI_SCALE, min(1.0, SE_REFERENCE / se_value))
+    return max(-1.0, phi * scale)
+
+
+def _apply_total_drop_floor(p_before: float, p_after: float) -> float:
+    return max(float(p_before) - MAX_MASTERY_DROP_PER_CYCLE, float(p_after))
 
 
 def _neo4j():
@@ -135,65 +158,255 @@ def _upsert_mastery(session, student_id: str, node_id: str, p_mastery: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Grader prompt — strict but fair judge for open-ended responses
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GRADER_PROMPT = """\
+You are a smart, fair grader for a K-8 adaptive math assessment. Your job is to determine whether
+the student demonstrates understanding of the core concept — NOT to reward long answers or penalize short ones.
+
+### CORE PRINCIPLE:
+**Brevity ≠ wrong. Verbosity ≠ correct.**
+A short answer that shows the right mathematical concept is correct.
+A long answer that dances around the concept without demonstrating it is wrong.
+
+### INPUTS PER QUESTION:
+1. Question text
+2. Standard Code & DOK Level
+3. Grading Rubric — what a correct answer must demonstrate
+4. Answer Key — the ideal answer (for reference, not as a template the student must match)
+5. Student Response — the raw text the student typed
+6. Time Taken (ms)
+
+### YOUR TASKS:
+1. **is_correct** (boolean): Does the student's response demonstrate the core mathematical concept
+   tested by this standard?
+   - YES if they show the right operation, relationship, or concept — even if brief or not fully worded.
+   - NO if they show a wrong concept, wrong operation, or give a numeric result when the question
+     asks for meaning/explanation of a concept.
+   - Examples:
+     • "4 times 6" for an area/tiles question → is_correct=true (shows correct multiplication; phi=0.5 for incompleteness)
+     • "24" for "what does 3×8 mean?" → is_correct=false (gave the product, not the meaning of multiplication)
+     • "multiply length times width" → is_correct=true, phi=1.0
+
+2. **phi** (float, -1.0 to 1.0) — signals quality/confidence, independent of is_correct:
+   - 1.0 = Complete and clear: concept fully demonstrated
+   - 0.5 = Correct concept shown but answer is partial, incomplete, or expression-only (no full sentence needed)
+   - 0.0 = Wrong, no sign of confusion — just an incorrect attempt
+   - -0.5 = Wrong with a traceable misconception shown in their work
+   - -1.0 = Blank, "I don't know", or complete breakdown
+
+3. **reasoning** (string): 1-sentence explanation of the grading decision.
+4. **misconception_flag** (string or null): If is_correct=false, name the exact cognitive error
+   (e.g. "Gave product instead of explaining what multiplication means"). If is_correct=true → null.
+
+### QUESTIONS TO GRADE:
+{blocks}
+
+### OUTPUT FORMAT:
+Return ONLY a valid JSON object (no markdown, no text outside JSON):
+{{
+  "<question_id>": {{"is_correct": bool, "phi": float, "reasoning": "...", "misconception_flag": "string or null"}},
+  ...
+}}
+
+Rules:
+- Empty or blank student_response: is_correct=false, phi=-1.0, misconception_flag="Did not attempt"
+- Wrong answer always caps phi at 0.0
+- Correct answer under 3000 ms on DOK≥2: phi ≤ 0.5
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Node 1 — score_answers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _grade_mc(q: dict, sub: dict) -> tuple[bool, float, str, str | None]:
+    """
+    Grade a multiple-choice question directly — no LLM needed.
+    Returns (is_correct, phi, reasoning, misconception).
+    """
+    correct_letter = (q.get("answer") or "").strip().upper()
+    selected       = (sub.get("selected_answer") or sub.get("student_response") or "").strip().upper()
+    time_ms        = float(sub.get("time_ms", 0.0))
+
+    # Normalise: accept "A", "a", "(A)", "A." etc.
+    if selected and selected[0] in "ABCD":
+        selected = selected[0]
+
+    is_correct = bool(selected) and selected == correct_letter
+
+    if not selected:
+        return False, -1.0, "No option selected", "Did not attempt"
+    if is_correct:
+        # Very fast on DOK≥2 is suspicious but MC DOK 1 is expected to be quick
+        phi = 0.7 if time_ms > 0 and time_ms < 3000 else 1.0
+        return True, phi, f"Correct option {selected} selected", None
+    else:
+        wrong_text = (q.get("options") or {}).get(selected, selected)
+        return False, 0.0, f"Selected {selected} (incorrect); correct was {correct_letter}", f"Chose distractor: {wrong_text}"
+
+
 def score_answers(state: AssessmentState) -> dict:
-    """Compare submitted answers against correct answers; build results list."""
+    """
+    Grade mixed MC + open-ended answers.
+
+    • Multiple-choice questions are graded instantly (no LLM call).
+    • Open-ended questions are sent to Gemini in a single batch call.
+
+    phi_signals are pre-populated so chat_to_signal skips re-analysis.
+    """
     logger.info("━" * 60)
-    logger.info("  PHASE B — STEP 1/7 │ score_answers")
-    logger.info(f"  {len(state.submitted_answers)} answers submitted for {len(state.questions)} questions")
+    logger.info("  PHASE B — STEP 1/7 │ score_answers  (Mixed MC + Open-Ended Grader)")
+    logger.info(f"  {len(state.submitted_answers)} answers submitted")
     logger.info("━" * 60)
+
     q_map = {q["id"]: q for q in state.questions}
-    results = []
+
+    # ── Separate MC from open-ended ────────────────────────────────────────────
+    mc_subs:      list[dict] = []
+    openend_subs: list[dict] = []
+    for sub in state.submitted_answers:
+        qid = sub.get("question_id", "")
+        q   = q_map.get(qid, {})
+        if q.get("type") == "multiple_choice":
+            mc_subs.append(sub)
+        else:
+            openend_subs.append(sub)
+
+    logger.info(f"  MC: {len(mc_subs)} questions | Open-ended: {len(openend_subs)} questions")
+
+    # ── Grade MC instantly ─────────────────────────────────────────────────────
+    mc_grades: dict[str, dict] = {}
+    for sub in mc_subs:
+        qid = sub.get("question_id", "")
+        q   = q_map.get(qid, {})
+        is_correct, phi, reasoning, misconception = _grade_mc(q, sub)
+        mc_grades[qid] = {
+            "is_correct":       is_correct,
+            "phi":              phi,
+            "reasoning":        reasoning,
+            "misconception_flag": misconception,
+        }
+
+    # ── LLM batch grades open-ended questions ──────────────────────────────────
+    oe_grades: dict[str, dict] = {}
+    if openend_subs:
+        blocks: list[str] = []
+        for sub in openend_subs:
+            qid      = sub.get("question_id", "")
+            q        = q_map.get(qid, {})
+            response = (sub.get("student_response") or sub.get("selected_answer") or "").strip()
+            time_ms  = float(sub.get("time_ms", 0.0))
+            blocks.append(
+                f"question_id: {qid}\n"
+                f"  standard: {q.get('standard_code', '')} | DOK: {q.get('dok_level', 2)}\n"
+                f"  question: {(q.get('question') or '')[:200]}\n"
+                f"  rubric: {q.get('rubric', '')}\n"
+                f"  answer_key: {q.get('answer_key', q.get('answer', ''))}\n"
+                f"  student_response: \"{response}\"\n"
+                f"  time_ms: {time_ms:.0f}\n"
+            )
+
+        llm = get_llm()
+        try:
+            raw = llm.generate_json(_GRADER_PROMPT.format(blocks="\n".join(blocks)))
+            if isinstance(raw, dict):
+                for qid, entry in raw.items():
+                    if isinstance(entry, dict):
+                        oe_grades[qid] = entry
+            logger.info(f"LLM Grader returned verdicts for {len(oe_grades)}/{len(openend_subs)} open-ended questions")
+        except Exception as exc:
+            logger.warning(f"LLM batch grader failed — heuristic fallback: {exc}")
+
+    # ── Build results + pre-populate phi_signals ───────────────────────────────
+    results: list[dict] = []
+    phi_signals: dict[str, dict] = {}
+    time_per_question: dict[str, float] = {}
     correct_count = 0
 
-    time_per_question: dict[str, float] = {}
+    for sub in state.submitted_answers:
+        qid     = sub.get("question_id", "")
+        q       = q_map.get(qid, {})
+        is_mc   = q.get("type") == "multiple_choice"
+        time_ms = float(sub.get("time_ms", 0.0))
+        dok     = int(q.get("dok_level", 2) or 2)
 
-    for submission in state.submitted_answers:
-        qid = submission.get("question_id", "")
-        selected = submission.get("selected_answer", "").upper().strip()
-        q = q_map.get(qid, {})
-        correct_ans = (q.get("answer") or "").upper().strip()
-        is_correct = selected == correct_ans
+        if is_mc:
+            response  = (sub.get("selected_answer") or sub.get("student_response") or "").strip().upper()
+            if response and response[0] in "ABCD":
+                response = response[0]
+            verdict = mc_grades.get(qid, {})
+        else:
+            response = (sub.get("student_response") or sub.get("selected_answer") or "").strip()
+            verdict  = oe_grades.get(qid)
+
+        if verdict:
+            is_correct    = bool(verdict.get("is_correct", False))
+            phi_raw       = float(verdict.get("phi", 0.0))
+            reasoning     = verdict.get("reasoning", "")
+            misconception = verdict.get("misconception_flag")
+        else:
+            # Heuristic fallback (open-ended only — MC always has a verdict)
+            is_correct    = bool(response)
+            phi_raw       = 0.5 if is_correct else (-1.0 if not response else 0.0)
+            reasoning     = "Heuristic fallback (grader unavailable)"
+            misconception = None if is_correct else "Could not determine (grader unavailable)"
+
+        phi_raw = max(-1.0, min(1.0, phi_raw))
 
         if is_correct:
             correct_count += 1
-
-        # Capture time-to-respond for Fidelity Multiplier (ms → stored per question)
-        time_ms = float(submission.get("time_ms", 0.0))
         if qid:
             time_per_question[qid] = time_ms
 
-        # Fluency flag: very fast correct answers (< 4 s) may indicate a guess
-        # This is used later by apply_fidelity_correction to halve the BKT gain.
-        is_likely_guess = is_correct and 0 < time_ms < 4000
+        phi_signals[qid] = {
+            "phi":         phi_raw,
+            "reason":      reasoning,
+            "gap_tag":     misconception,
+            "target_node": None,
+        }
 
-        # Chat message typed by the student alongside this answer (may be empty)
-        chat_message = submission.get("chat_message", "") or ""
+        correct_answer = q.get("answer_key") or q.get("answer") or ""
+        if is_mc:
+            # For MC store the letter + text of the correct answer
+            correct_letter = (q.get("answer") or "").strip().upper()
+            correct_text   = (q.get("options") or {}).get(correct_letter, "")
+            correct_answer = f"{correct_letter}: {correct_text}" if correct_text else correct_letter
 
         results.append({
-            "question_id": qid,
-            "question":    q.get("question", ""),
-            "options":     q.get("options", []),
-            "correct_answer": correct_ans,
-            "student_answer": selected,
-            "is_correct":   is_correct,
-            "is_likely_guess": is_likely_guess,
-            "time_ms":      time_ms,
-            "chat_message": chat_message,
-            "category":     q.get("category", "target"),
-            "dok_level":    q.get("dok_level", 2),
+            "question_id":   qid,
+            "question":      q.get("question", ""),
+            "correct_answer": correct_answer,
+            "student_answer": response,
+            "chat_message":  response,
+            "is_correct":    is_correct,
+            "is_likely_guess": is_correct and 0 < time_ms < 4000 and dok >= 2 and not is_mc,
+            "time_ms":       time_ms,
+            "question_type": "multiple_choice" if is_mc else "open_ended",
+            "grader_reasoning":     reasoning,
+            "grader_misconception": misconception,
+            "grader_phi":           phi_raw,
+            "category":      q.get("category", "target"),
+            "dok_level":     dok,
             "standard_code": q.get("standard_code", ""),
-            "node_ref":     q.get("node_ref", ""),
-            "beta":         q.get("beta", 0.0),
-            "mastery_before": 0.0,  # filled in update_rasch
+            "node_ref":      q.get("node_ref", ""),
+            "beta":          q.get("beta", 0.0),
+            "mastery_before": 0.0,
             "mastery_after":  0.0,
         })
 
     score = correct_count / max(len(results), 1)
-    logger.info(f"Evaluation Agent: score={score:.2%}  ({correct_count}/{len(results)})")
-    return {"results": results, "score": score, "time_per_question": time_per_question}
+    logger.info(
+        f"Grader: score={score:.2%}  ({correct_count}/{len(results)}) "
+        f"[MC: {len(mc_subs)} instant, OE: {len(openend_subs)} LLM]"
+    )
+    return {
+        "results":           results,
+        "score":             score,
+        "time_per_question": time_per_question,
+        "phi_signals":       phi_signals,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,7 +555,7 @@ def _backpropagate_to_prerequisites(
         code = item.get("root_prerequisite_code")
         if not code:
             continue
-        penalty = float(item.get("mastery_penalty", 0.15))
+        penalty = _cap_llm_penalty(float(item.get("mastery_penalty", 0.15)))
         # Take the largest penalty if a prereq appears multiple times
         prereq_penalties[code] = max(prereq_penalties.get(code, 0.0), penalty)
 
@@ -379,7 +592,9 @@ def _backpropagate_to_prerequisites(
                 # then run a BKT incorrect update (marks an observed failure)
                 p_penalised = max(0.05, p_before - penalty)
                 p_after = _bkt_update(p_penalised, correct=False,
-                                      p_slip=p_slip, p_guess=p_guess, p_transit=p_transit)
+                                      p_slip=p_slip, p_guess=p_guess, p_transit=p_transit,
+                                      phi=0.0)
+                p_after = _apply_total_drop_floor(p_before, p_after)
 
                 # Read current attempt counts
                 count_row = session.run(
@@ -436,20 +651,22 @@ def update_bkt(state: AssessmentState) -> dict:
 
                 # Apply misconception penalty (LLM layer signal)
                 std_code = r.get("standard_code", "")
-                penalty = state.misconception_weights.get(std_code, 0.0)
+                penalty = _cap_llm_penalty(state.misconception_weights.get(std_code, 0.0))
                 p_before_adj = max(0.05, p_before - penalty)
 
                 # Pull φ from the Signal Bridge output (defaults by correctness if absent)
                 qid = r.get("question_id", "")
                 phi_entry = state.phi_signals.get(qid, {})
                 if phi_entry:
-                    phi = float(phi_entry.get("phi", 1.0 if r["is_correct"] else 0.0))
+                    phi_raw = float(phi_entry.get("phi", 1.0 if r["is_correct"] else 0.0))
                 else:
                     # No chat signal available — fall back to time-based fidelity
-                    phi = 0.5 if r.get("is_likely_guess") else (1.0 if r["is_correct"] else 0.0)
+                    phi_raw = 0.5 if r.get("is_likely_guess") else (1.0 if r["is_correct"] else 0.0)
+                phi = _dampen_negative_phi(phi_raw, state.se)
 
                 # φ-modulated BKT update
                 p_after = _bkt_update(p_before_adj, r["is_correct"], p_slip, p_guess, p_transit, phi)
+                p_after = _apply_total_drop_floor(p_before, p_after)
 
                 # Count attempts/correct in Neo4j
                 count_r = neo_sess.run(
@@ -470,7 +687,9 @@ def update_bkt(state: AssessmentState) -> dict:
                     "mastery_before": round(p_before, 3),
                     "mastery_after":  round(p_after, 3),
                     "rasch_mastery":  round(p_after, 3),
+                    "phi_raw":        round(phi_raw, 3),
                     "phi":            round(phi, 3),
+                    "misconception_penalty": round(penalty, 3),
                 }
     except Exception as exc:
         logger.error(f"BKT update failed: {exc}")

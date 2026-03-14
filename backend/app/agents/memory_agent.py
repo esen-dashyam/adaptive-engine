@@ -65,6 +65,11 @@ def consolidate_memory(state: AssessmentState) -> dict:
 
     session_id = state.pg_session_id or str(uuid.uuid4())
     driver = _neo4j()
+    misconception_by_qid = {
+        m.get("question_id", ""): m
+        for m in state.misconceptions
+        if m.get("question_id")
+    }
 
     try:
         with driver.session() as neo:
@@ -75,6 +80,7 @@ def consolidate_memory(state: AssessmentState) -> dict:
                 qid  = r.get("question_id", "")
                 if not nid or not qid:
                     continue
+                misconception = misconception_by_qid.get(qid, {})
 
                 neo.run(
                     """
@@ -89,11 +95,14 @@ def consolidate_memory(state: AssessmentState) -> dict:
                     MATCH (n:StandardsFrameworkItem {identifier: $nid})
                     MERGE (q)-[:TESTS]->(n)
                     WITH q
-                    MATCH (s:Student {id: $sid})
+                    MERGE (s:Student {id: $sid})
                     MERGE (s)-[a:ATTEMPTED {session_id: $sess_id, question_id: $qid}]->(q)
                     SET   a.correct          = $correct,
                           a.selected_answer  = $selected,
                           a.correct_answer   = $correct_ans,
+                          a.phi              = $phi,
+                          a.misconception    = $misconception,
+                          a.root_prerequisite_code = $root_prereq,
                           a.timestamp        = $now
                     """,
                     qid=qid,
@@ -109,6 +118,9 @@ def consolidate_memory(state: AssessmentState) -> dict:
                     correct=r.get("is_correct", False),
                     selected=r.get("student_answer", ""),
                     correct_ans=r.get("correct_answer", ""),
+                    phi=r.get("phi"),
+                    misconception=misconception.get("misconception", ""),
+                    root_prereq=misconception.get("root_prerequisite_code"),
                 )
                 persisted += 1
 
@@ -239,6 +251,9 @@ def load_exercise_memory(state: AssessmentState) -> dict:
                        q.question_type   AS question_type,
                        q.difficulty_beta AS beta,
                        a.correct         AS correct,
+                       a.phi             AS phi,
+                       a.misconception   AS misconception,
+                       a.root_prerequisite_code AS root_prerequisite_code,
                        a.timestamp       AS timestamp,
                        a.session_id      AS session_id
                 ORDER BY a.timestamp DESC
@@ -256,6 +271,9 @@ def load_exercise_memory(state: AssessmentState) -> dict:
                         "question_type":  row.get("question_type", "target"),
                         "beta":           row.get("beta", 0.0),
                         "correct":        row.get("correct", False),
+                        "phi":            row.get("phi"),
+                        "misconception":  row.get("misconception", ""),
+                        "root_prerequisite_code": row.get("root_prerequisite_code"),
                         "timestamp":      row.get("timestamp", ""),
                         "session_id":     row.get("session_id", ""),
                     })
