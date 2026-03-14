@@ -23,6 +23,11 @@ from backend.app.api.routes.rasch import router as rasch_router
 from backend.app.api.routes.chat import router as chat_router
 from backend.app.api.routes.exercises import router as exercises_router
 
+# Calendar Scheduler routes (Supabase-backed)
+from backend.app.api.routes.scheduler_students import router as sched_students_router
+from backend.app.api.routes.scheduler_courses import router as sched_courses_router
+from backend.app.api.routes.scheduler_schedule import router as sched_schedule_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -78,6 +83,11 @@ app.include_router(agent_router,      prefix=settings.api_prefix)
 app.include_router(rasch_router,      prefix=settings.api_prefix)
 app.include_router(chat_router,       prefix=settings.api_prefix)
 app.include_router(exercises_router,  prefix=settings.api_prefix)
+
+# Calendar Scheduler
+app.include_router(sched_students_router, prefix=settings.api_prefix)
+app.include_router(sched_courses_router,  prefix=settings.api_prefix)
+app.include_router(sched_schedule_router, prefix=settings.api_prefix)
 
 
 @app.get("/", tags=["Health"])

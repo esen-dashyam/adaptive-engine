@@ -60,5 +60,9 @@ class Settings(BaseSettings):
     rag_max_existing_questions: int = 5 # existing question stems to inject for diversity
     rag_fulltext_index: str = "standardsDescription"  # Neo4j FTS index name
 
+    # ── Calendar Scheduler (Supabase) ────────────────────
+    supabase_url: str = ""
+    supabase_key: str = ""
+
 
 settings = Settings()
