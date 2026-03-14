@@ -27,6 +27,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 className="px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors font-medium">
                 Parent
               </a>
+              <a href="/journey"
+                className="px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors font-medium">
+                Journey
+              </a>
               <a href="/tutor"
                 className="px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors font-medium">
                 AI Tutor

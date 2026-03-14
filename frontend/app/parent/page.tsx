@@ -28,6 +28,18 @@ const PARENT_PROMPTS = [
   "How do I make learning fun for them?",
 ];
 
+type LastAssessmentSnapshot = {
+  assessment_id: string;
+  score: number;
+  total: number;
+  correct: number;
+  grade: string;
+  subject: string;
+  failed_standard_codes: string[];
+  failed_standards: { code: string; question: string }[];
+  timestamp: string;
+};
+
 type ParentSummary = {
   has_data: boolean;
   overall_status: string;
@@ -53,6 +65,11 @@ export default function ParentPage() {
   const [chatInput, setChatInput]   = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const [lastAssessment, setLastAssessment] = useState<LastAssessmentSnapshot | null>(null);
+  const [existingFeedback, setExistingFeedback] = useState<{accurate: string; notes: string} | null>(null);
+  const [feedbackChoice, setFeedbackChoice] = useState<"yes" | "somewhat" | "no" | null>(null);
+  const [feedbackNotes, setFeedbackNotes] = useState("");
+  const [feedbackSaved, setFeedbackSaved] = useState(false);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -61,12 +78,25 @@ export default function ParentPage() {
   async function loadReport() {
     if (!studentId.trim()) { setError("Please enter your child's student ID."); return; }
     setLoading(true); setError(null); setSummary(null); setChatMessages([]);
+    setLastAssessment(null); setExistingFeedback(null); setFeedbackChoice(null);
+    setFeedbackNotes(""); setFeedbackSaved(false);
     try {
-      // 1. Load mastery context
-      const ctxRes = await fetch(`${API}/chat/context/${encodeURIComponent(studentId)}?subject=${subject}`);
+      // 1. Load mastery context + last assessment in parallel
+      const [ctxRes, lastRes] = await Promise.all([
+        fetch(`${API}/chat/context/${encodeURIComponent(studentId)}?subject=${subject}`),
+        fetch(`${API}/assessment/student/${encodeURIComponent(studentId)}/last_result`),
+      ]);
       if (!ctxRes.ok) throw new Error("Could not load student data");
       const ctx = await ctxRes.json();
       setMasteryCtx(ctx);
+
+      if (lastRes.ok) {
+        const lastData = await lastRes.json();
+        if (lastData.has_data) {
+          setLastAssessment(lastData.snapshot);
+          if (lastData.parent_feedback) setExistingFeedback(lastData.parent_feedback);
+        }
+      }
 
       // 2. Generate parent-friendly summary
       const sumRes = await fetch(`${API}/chat/parent_summary`, {
@@ -85,6 +115,30 @@ export default function ParentPage() {
       setSummary(sumData);
     } catch (e: any) { setError(e.message); }
     finally { setLoading(false); }
+  }
+
+  async function submitFeedback(choice: "yes" | "somewhat" | "no") {
+    setFeedbackChoice(choice);
+    if (choice === "yes") {
+      // Save immediately for yes
+      await saveFeedback(choice, "");
+    }
+  }
+
+  async function saveFeedback(choice: string, notes: string) {
+    try {
+      await fetch(`${API}/assessment/parent_feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          student_id: studentId,
+          assessment_id: lastAssessment?.assessment_id ?? "",
+          accurate: choice,
+          parent_notes: notes,
+        }),
+      });
+      setFeedbackSaved(true);
+    } catch {}
   }
 
   async function sendChat(override?: string) {
@@ -248,6 +302,81 @@ export default function ParentPage() {
           {summary.encouragement && (
             <div className="text-center py-2">
               <p className="text-sm text-slate-500 italic">{summary.encouragement}</p>
+            </div>
+          )}
+
+          {/* Assessment Accuracy Confirmation */}
+          {lastAssessment && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 bg-amber-100 rounded-lg flex items-center justify-center">
+                  <svg className="w-4 h-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-slate-900 text-sm">Recent Assessment — Does this seem accurate?</h3>
+                  <p className="text-xs text-slate-400">{new Date(lastAssessment.timestamp).toLocaleDateString()} · {lastAssessment.correct}/{lastAssessment.total} correct ({Math.round(lastAssessment.score * 100)}%)</p>
+                </div>
+              </div>
+
+              {lastAssessment.failed_standards.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">Topics {name} struggled with</p>
+                  {lastAssessment.failed_standards.slice(0, 4).map((f, i) => (
+                    <div key={i} className="flex items-start gap-2 bg-red-50 rounded-xl px-3 py-2">
+                      <span className="text-xs font-bold text-red-500 flex-shrink-0 mt-0.5">{f.code}</span>
+                      <span className="text-xs text-slate-600 leading-relaxed line-clamp-2">{f.question}</span>
+                    </div>
+                  ))}
+                  {lastAssessment.failed_standards.length > 4 && (
+                    <p className="text-xs text-slate-400 pl-1">+{lastAssessment.failed_standards.length - 4} more</p>
+                  )}
+                </div>
+              )}
+
+              {existingFeedback || feedbackSaved ? (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm text-emerald-700 font-medium">
+                  {existingFeedback?.accurate === "yes" || feedbackChoice === "yes"
+                    ? "You confirmed this assessment looks accurate."
+                    : existingFeedback?.accurate === "somewhat" || feedbackChoice === "somewhat"
+                    ? "Thanks — noted that this is partially accurate."
+                    : "Thanks — we've noted this doesn't match what you see at home."}
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm text-slate-700">As {name}&apos;s parent, does this match what you see at home?</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([
+                      { id: "yes", label: "Yes, accurate", color: "border-emerald-300 hover:bg-emerald-50 hover:text-emerald-700" },
+                      { id: "somewhat", label: "Somewhat", color: "border-amber-300 hover:bg-amber-50 hover:text-amber-700" },
+                      { id: "no", label: "Not really", color: "border-red-300 hover:bg-red-50 hover:text-red-700" },
+                    ] as const).map(opt => (
+                      <button key={opt.id}
+                        onClick={() => submitFeedback(opt.id)}
+                        className={`py-2 rounded-xl text-xs font-semibold border transition-colors text-slate-600 ${opt.color} ${feedbackChoice === opt.id ? "ring-2 ring-offset-1 ring-current" : ""}`}>
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  {(feedbackChoice === "somewhat" || feedbackChoice === "no") && !feedbackSaved && (
+                    <div className="space-y-2">
+                      <textarea
+                        value={feedbackNotes}
+                        onChange={e => setFeedbackNotes(e.target.value)}
+                        placeholder={`What do you think ${name} actually struggles with or does well?`}
+                        rows={3}
+                        className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-none"
+                      />
+                      <button
+                        onClick={() => saveFeedback(feedbackChoice, feedbackNotes)}
+                        className="w-full bg-emerald-600 text-white py-2 rounded-xl text-sm font-semibold hover:bg-emerald-700 transition-colors">
+                        Submit feedback
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
 
