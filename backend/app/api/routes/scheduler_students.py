@@ -1,8 +1,9 @@
 """Scheduler — Student endpoints (ported from Calendar Scheduler).
 
-GET  /api/v1/scheduler/students          — list all students
-GET  /api/v1/scheduler/students/{id}     — get student detail
-GET  /api/v1/scheduler/students/{id}/stats — check-in statistics
+GET  /api/v1/scheduler/students                      — list all students
+GET  /api/v1/scheduler/students/{id}                 — get student detail
+GET  /api/v1/scheduler/students/{id}/stats           — check-in statistics
+GET  /api/v1/scheduler/students/{id}/subject-progress — per-subject completion
 """
 from __future__ import annotations
 
@@ -126,4 +127,52 @@ async def get_checkin_stats(student_id: str) -> dict[str, Any]:
         }
     except Exception as exc:
         logger.error("Failed to get stats for {}: {}", student_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/{student_id}/subject-progress", summary="Per-subject completion stats")
+async def get_subject_progress(student_id: str) -> list[dict[str, Any]]:
+    """Aggregate session completion rates grouped by course subject."""
+    try:
+        sb = get_supabase()
+        schedules = (
+            sb.table("schedules")
+            .select("*, courses(*)")
+            .eq("student_id", student_id)
+            .eq("status", "active")
+            .execute()
+            .data
+        )
+
+        subject_data: dict[str, dict[str, int]] = {}
+        for sch in schedules:
+            course = sch.get("courses") or {}
+            subj = course.get("subject", "Unknown")
+            sessions = (
+                sb.table("session_instances")
+                .select("id, status")
+                .eq("schedule_id", sch["id"])
+                .execute()
+                .data
+            )
+            if subj not in subject_data:
+                subject_data[subj] = {"total": 0, "completed": 0}
+            subject_data[subj]["total"] += len(sessions)
+            subject_data[subj]["completed"] += sum(
+                1 for s in sessions if s["status"] == "completed"
+            )
+
+        return [
+            {
+                "subject": subj,
+                "total_sessions": d["total"],
+                "completed_sessions": d["completed"],
+                "completion_rate": round((d["completed"] / d["total"]) * 100)
+                if d["total"] > 0
+                else 0,
+            }
+            for subj, d in subject_data.items()
+        ]
+    except Exception as exc:
+        logger.error("Failed to get subject progress for {}: {}", student_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))

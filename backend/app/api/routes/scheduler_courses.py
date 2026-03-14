@@ -1,9 +1,10 @@
 """Scheduler — Course endpoints (ported from Calendar Scheduler).
 
-GET  /api/v1/scheduler/courses              — list all courses
-GET  /api/v1/scheduler/courses/{id}         — get course detail
-GET  /api/v1/scheduler/courses/search       — search/filter courses
-GET  /api/v1/scheduler/students/{id}/courses — student's enrolled courses
+GET  /api/v1/scheduler/courses                       — list all courses
+GET  /api/v1/scheduler/courses/{id}                  — get course detail
+GET  /api/v1/scheduler/courses/search                — search/filter courses
+GET  /api/v1/scheduler/students/{id}/courses         — student's enrolled courses
+GET  /api/v1/scheduler/students/{id}/course-progress — per-course completion stats
 """
 from __future__ import annotations
 
@@ -90,4 +91,54 @@ async def get_student_courses(student_id: str) -> list[dict[str, Any]]:
         return data
     except Exception as exc:
         logger.error("Failed to get courses for {}: {}", student_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/students/{student_id}/course-progress", summary="Per-course completion stats")
+async def get_course_progress(student_id: str) -> list[dict[str, Any]]:
+    """Compute progress for each enrolled course from session_instances."""
+    try:
+        sb = get_supabase()
+        schedules = (
+            sb.table("schedules")
+            .select("*, courses(*)")
+            .eq("student_id", student_id)
+            .eq("status", "active")
+            .order("start_date")
+            .execute()
+            .data
+        )
+
+        result: list[dict[str, Any]] = []
+        for sch in schedules:
+            course = sch.get("courses") or {}
+            all_sessions = (
+                sb.table("session_instances")
+                .select("id, status")
+                .eq("schedule_id", sch["id"])
+                .execute()
+                .data
+            )
+            total = len(all_sessions)
+            completed = sum(1 for s in all_sessions if s["status"] == "completed")
+            progress = round((completed / total) * 100) if total > 0 else 0
+
+            result.append(
+                {
+                    "schedule_id": sch["id"],
+                    "course_id": course.get("id"),
+                    "course_code": course.get("code"),
+                    "title": course.get("title"),
+                    "subject": course.get("subject"),
+                    "duration_weeks": course.get("duration_weeks"),
+                    "total_sessions": total,
+                    "completed_sessions": completed,
+                    "progress": progress,
+                    "start_date": sch.get("start_date"),
+                    "end_date": sch.get("end_date"),
+                }
+            )
+        return result
+    except Exception as exc:
+        logger.error("Failed to get course progress for {}: {}", student_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
