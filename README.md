@@ -422,14 +422,14 @@ Wait ~10 seconds for Neo4j and Postgres to finish initializing before the next s
 
 ### 3. Load the knowledge graph
 
-The Neo4j image on Docker Hub (`esendashnyam/ale-neo4j:latest`) has the full 144,733-node curriculum graph pre-baked. `docker compose up` in the next step pulls it automatically — **nothing extra to do**.
+The Neo4j image on Docker Hub (`esen0719/ale-neo4j:latest`) has the full 144,733-node curriculum graph pre-baked. `docker compose up` in the next step pulls it automatically — **nothing extra to do**.
 
 On first start the container auto-restores the dump into `/data`. Subsequent starts skip this and boot normally.
 
 > **Rebuilding the image** (maintainers only — only needed after re-ingesting data):
 > ```bash
-> docker build -f infra/Dockerfile.neo4j -t esendashnyam/ale-neo4j:latest .
-> docker push esendashnyam/ale-neo4j:latest
+> docker build -f infra/Dockerfile.neo4j -t esen0719/ale-neo4j:latest .
+> docker push esen0719/ale-neo4j:latest
 > ```
 
 ### 4. Start backend

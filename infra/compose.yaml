@@ -1,6 +1,6 @@
 services:
   neo4j:
-    image: ${NEO4J_IMAGE:-esendashnyam/ale-neo4j:latest}
+    image: ${NEO4J_IMAGE:-esen0719/ale-neo4j:latest}
     container_name: ale-neo4j
     ports:
       - "7474:7474"
