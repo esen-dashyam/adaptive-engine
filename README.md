@@ -424,32 +424,38 @@ Wait ~10 seconds for Neo4j and Postgres to finish initializing before the next s
 
 This step populates Neo4j with the 144,733 curriculum nodes. **Only needs to be done once.**
 
-First, make sure the Learning Commons export files exist at:
+#### Option A — Restore from dump (recommended, ~2 min)
+
+Download `knowledge-graph.dump` from the shared Google Drive link (ask the team) and place it at:
 ```
-data/learning-commons-kg/exports/nodes.jsonl
-data/learning-commons-kg/exports/relationships.jsonl
+data/knowledge-graph.dump
 ```
 
-Then run:
+The `compose.yaml` mounts `data/` into the container at `/backups`. Restore with:
 
 ```bash
-# Install dependencies first
-poetry install
+# Neo4j must be running first
+docker compose -f infra/compose.yaml up -d
 
-# Import all K1–K8 nodes and relationships
-poetry run python scripts/import_learning_commons.py --grades 1 2 3 4 5 6 7 8
+# Wait ~10s for Neo4j to initialize, then restore
+docker exec -it ale-neo4j neo4j-admin database load neo4j \
+  --from-path=/backups/knowledge-graph.dump \
+  --overwrite-destination=true
 
-# Build prerequisite edges (98.7% of nodes have none in the raw data)
-poetry run python scripts/enrich_prerequisite_edges.py
-
-# Optional: use Gemini to infer additional CCSS prerequisite edges
-poetry run python scripts/enrich_prerequisite_edges.py --llm
-
-# Optional: ingest PDFs for GraphRAG context
-poetry run python scripts/ingest_pdfs.py
+# Restart Neo4j to pick up the restored data
+docker restart ale-neo4j
 ```
 
-> **Dry run first?** Add `--dry-run` to either script to preview what would be written without touching the database.
+#### Option B — Build from source (slow, requires raw data files)
+
+Only needed if you don't have the dump. Requires `data/learning-commons-kg/exports/nodes.jsonl` and `relationships.jsonl` from the Learning Commons export.
+
+```bash
+poetry install
+poetry run python scripts/import_learning_commons.py --grades 1 2 3 4 5 6 7 8
+poetry run python scripts/enrich_prerequisite_edges.py
+# Optional: poetry run python scripts/enrich_prerequisite_edges.py --llm
+```
 
 ### 4. Start backend
 
