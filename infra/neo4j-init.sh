@@ -6,7 +6,7 @@ set -e
 if [ ! -d "/data/databases/neo4j" ]; then
     echo "==> First start: loading knowledge graph dump (~144k nodes)..."
     neo4j-admin database load neo4j \
-        --from-path=/startup/kg.dump \
+        --from-path=/startup \
         --overwrite-destination=true
     echo "==> Knowledge graph loaded."
 else
