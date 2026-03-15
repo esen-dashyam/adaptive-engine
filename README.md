@@ -418,14 +418,48 @@ cp .env.example .env
 docker compose -f infra/compose.yaml up -d
 ```
 
-### 3. Start backend
+Wait ~10 seconds for Neo4j and Postgres to finish initializing before the next step.
 
-```bash
-poetry install
-poetry run uvicorn backend.app.main:app --reload --port 8000
+### 3. Load the knowledge graph
+
+This step populates Neo4j with the 144,733 curriculum nodes. **Only needs to be done once.**
+
+First, make sure the Learning Commons export files exist at:
+```
+data/learning-commons-kg/exports/nodes.jsonl
+data/learning-commons-kg/exports/relationships.jsonl
 ```
 
-### 4. Start frontend
+Then run:
+
+```bash
+# Install dependencies first
+poetry install
+
+# Import all K1–K8 nodes and relationships
+poetry run python scripts/import_learning_commons.py --grades 1 2 3 4 5 6 7 8
+
+# Build prerequisite edges (98.7% of nodes have none in the raw data)
+poetry run python scripts/enrich_prerequisite_edges.py
+
+# Optional: use Gemini to infer additional CCSS prerequisite edges
+poetry run python scripts/enrich_prerequisite_edges.py --llm
+
+# Optional: ingest PDFs for GraphRAG context
+poetry run python scripts/ingest_pdfs.py
+```
+
+> **Dry run first?** Add `--dry-run` to either script to preview what would be written without touching the database.
+
+### 4. Start backend
+
+```bash
+poetry run uvicorn backend.app.main:app --reload --port 8000 --app-dir backend
+```
+
+> **Important:** run this from the project root (not `backend/`) so the `.env` file is picked up.
+
+### 5. Start frontend
 
 ```bash
 cd frontend

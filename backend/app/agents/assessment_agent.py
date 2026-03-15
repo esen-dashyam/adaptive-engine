@@ -105,6 +105,31 @@ def select_standards_irt(state: AssessmentState) -> dict:  # noqa: C901
             # Already-asked node identifiers (from prior batches in elastic stopping)
             asked_ids = list({q.get("node_ref", "") for q in state.questions if q.get("node_ref")})
 
+            # ── Retry mode: pinned to specific standard codes ─────────────────
+            if state.pinned_standard_codes:
+                res = session.run(
+                    """
+                    UNWIND $codes AS code
+                    MATCH (n:StandardsFrameworkItem {statementCode: code})
+                    RETURN n.identifier AS identifier, n.statementCode AS code,
+                           n.description AS description, n.gradeLevelList AS gradeLevelList
+                    LIMIT 10
+                    """,
+                    codes=state.pinned_standard_codes,
+                )
+                pinned_nodes = [
+                    {**r.data(), "grade": grade_num, "category": "target", "dok_level": 2,
+                     "subject": subject_name}
+                    for r in res
+                ]
+                if pinned_nodes:
+                    logger.info(f"  Retry mode — pinned to {len(pinned_nodes)} standards: {state.pinned_standard_codes}")
+                    return {
+                        "target_standards": pinned_nodes,
+                        "prerequisite_standards": [],
+                        "all_nodes": pinned_nodes,
+                    }
+
             def _query_nodes(grade: str, jur: str, category: str, dok: int, limit: int):
                 res = session.run(
                     """
@@ -395,25 +420,38 @@ Student: {grade_label} | Subject: {subject_name} | Student Ability θ={state.the
 Standards to test:
 {chr(10).join(node_lines)}
 
-Generate exactly {len(nodes)} multiple-choice questions.
+Generate exactly {len(nodes)} questions using a MIXED format:
 
-Rules:
+━━ PREREQUISITE questions (category=prerequisite, β < 0) → type: "multiple_choice" ━━
+• DOK 1: quick factual recall or direct skill check (e.g. "What is 6 × 7?", "Which fraction is larger?")
+• Write exactly 4 answer options (A, B, C, D). One option is clearly correct. The other three are plausible mistakes a real student might make (e.g. wrong operation, off-by-one, common misconception) — NOT obviously wrong.
+• Set "answer" to the letter of the correct option ("A", "B", "C", or "D").
+
+━━ TARGET questions (category=target, β ≥ 0) → type: "open_ended" ━━
+• DOK 2-3: one short, direct question — max 2 sentences. Ask for ONE thing only (solve it OR explain it, not both).
+• No compound instructions like "Explain your thinking. Show your work. Then write..."
+• Keep vocabulary simple and age-appropriate. Avoid long setup sentences.
+• Write a "rubric" (1 sentence: exactly what concept or operation a correct answer MUST show).
+• Write an "answer_key" (the shortest complete correct answer — the student does NOT need to match this word-for-word).
+
+Shared rules (ALL questions):
 1. Use {state.framework} terminology, age-appropriate for {grade_label}
-2. PREREQUISITE questions (β < 0): DOK 1 — direct recall of foundational knowledge
-3. TARGET questions (β ≥ 0): DOK 2-3 — problem-solving and application
-4. Each question tests ONE standard — write a REAL curriculum problem, NOT meta-questions about standards
-5. Exactly 4 options (A, B, C, D) with ONE correct answer
-6. Questions should match the student's ability: θ={state.theta:+.2f} (0=average, positive=strong, negative=struggling)
-7. Do NOT repeat any stems listed under AVOID above
-8. CRITICAL: Do NOT generate questions that require a visual, image, diagram, line plot, chart, table, or any graphic that cannot be displayed as plain text. Every question must be 100% self-contained in words and numbers only. If a standard normally uses visuals (e.g. line plots, bar charts, geometric figures), write a word-problem version instead.
-9. PREREQUISITE CONSTRAINT: For each standard, the KG Context above lists three tiers:
-   - AVAILABLE prereqs: the student has mastered these — your question MAY assume this knowledge
-   - CAUTION prereqs: partial knowledge — keep vocabulary and steps simple for these
-   - DO NOT USE: concepts beyond this standard — never introduce these in the question or answer choices
-   A student must be able to solve the question using ONLY the AVAILABLE skills. If a skill appears under DO NOT USE, it must not appear anywhere in the question, options, or solution path.
+2. Each question tests ONE standard — write a REAL curriculum problem, NOT a meta-question about a standard
+3. θ={state.theta:+.2f}: 0=average, positive=advanced, negative=struggling — calibrate difficulty accordingly
+4. Do NOT repeat stems listed under AVOID above
+5. CRITICAL — TEXT-ONLY INTERFACE: Students type answers into a plain text box. You MUST NEVER ask them to draw, sketch, plot, shade, label a diagram, use a number line, create a graph, or do anything requiring pencil and paper. Forbidden phrases: "draw", "sketch", "plot", "shade", "label the", "use the number line", "complete the table", "fill in". If a standard normally uses visuals, ask the student to DESCRIBE or CALCULATE instead. Example: instead of "Draw a number line and mark 1/2", ask "Where would 1/2 be on a number line from 0 to 1? Explain how you know."
+6. PREREQUISITE CONSTRAINT — three tiers per standard in KG Context:
+   - AVAILABLE prereqs: student mastered these — you MAY assume this knowledge
+   - CAUTION prereqs: partial knowledge — keep vocabulary simple
+   - DO NOT USE: beyond this standard — never mention these concepts
 
-Return ONLY a valid JSON array. Each element must be:
-{{"id":"<uuid>","type":"multiple_choice","question":"<text>","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","dok_level":1,"category":"prerequisite|target","standard_code":"<code>","node_index":<int>}}"""
+Return ONLY a valid JSON array. No markdown, no explanation. Use EXACTLY these schemas:
+
+Multiple choice:
+{{"id":"<uuid>","type":"multiple_choice","question":"<text>","options":{{"A":"<text>","B":"<text>","C":"<text>","D":"<text>"}},"answer":"A|B|C|D","dok_level":1,"category":"prerequisite","standard_code":"<code>","node_index":<int>}}
+
+Open-ended:
+{{"id":"<uuid>","type":"open_ended","question":"<text>","rubric":"<specific grading criteria>","answer_key":"<model answer with key steps>","dok_level":2,"category":"target","standard_code":"<code>","node_index":<int>}}"""
 
     llm = get_llm()
     try:

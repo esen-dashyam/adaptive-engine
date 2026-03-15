@@ -32,6 +32,8 @@ class AssessmentState(BaseModel):
     target_standards: list[dict[str, Any]] = Field(default_factory=list)
     prerequisite_standards: list[dict[str, Any]] = Field(default_factory=list)
     all_nodes: list[dict[str, Any]] = Field(default_factory=list)
+    # If set, assessment is pinned to these specific standard codes (retry mode)
+    pinned_standard_codes: list[str] = Field(default_factory=list)
 
     # ── RAG context ───────────────────────────────────────────────────────────
     rag_context_map: dict[str, Any] = Field(default_factory=dict)
