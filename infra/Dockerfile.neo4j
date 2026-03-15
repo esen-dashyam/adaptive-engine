@@ -1,0 +1,16 @@
+FROM neo4j:5.16-community
+
+ENV NEO4J_AUTH=neo4j/password
+ENV NEO4J_PLUGINS=["apoc"]
+ENV NEO4J_server_memory_heap_max__size=2G
+ENV NEO4J_server_memory_pagecache_size=1G
+ENV NEO4J_server_default__listen__address=0.0.0.0
+ENV NEO4J_server_bolt_advertised__address=localhost:7687
+ENV NEO4J_server_http_advertised__address=localhost:7474
+
+# Copy the dump to a path outside the /data volume so it survives layer commits
+COPY data/knowledge-graph.dump /startup/kg.dump
+COPY infra/neo4j-init.sh /startup/init.sh
+RUN chmod +x /startup/init.sh
+
+ENTRYPOINT ["/startup/init.sh"]

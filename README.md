@@ -422,40 +422,15 @@ Wait ~10 seconds for Neo4j and Postgres to finish initializing before the next s
 
 ### 3. Load the knowledge graph
 
-This step populates Neo4j with the 144,733 curriculum nodes. **Only needs to be done once.**
+The Neo4j image on Docker Hub (`esendashnyam/ale-neo4j:latest`) has the full 144,733-node curriculum graph pre-baked. `docker compose up` in the next step pulls it automatically — **nothing extra to do**.
 
-#### Option A — Restore from dump (recommended, ~2 min)
+On first start the container auto-restores the dump into `/data`. Subsequent starts skip this and boot normally.
 
-Download `knowledge-graph.dump` from the shared Google Drive link (ask the team) and place it at:
-```
-data/knowledge-graph.dump
-```
-
-The `compose.yaml` mounts `data/` into the container at `/backups`. Restore with:
-
-```bash
-# Neo4j must be running first
-docker compose -f infra/compose.yaml up -d
-
-# Wait ~10s for Neo4j to initialize, then restore
-docker exec -it ale-neo4j neo4j-admin database load neo4j \
-  --from-path=/backups/knowledge-graph.dump \
-  --overwrite-destination=true
-
-# Restart Neo4j to pick up the restored data
-docker restart ale-neo4j
-```
-
-#### Option B — Build from source (slow, requires raw data files)
-
-Only needed if you don't have the dump. Requires `data/learning-commons-kg/exports/nodes.jsonl` and `relationships.jsonl` from the Learning Commons export.
-
-```bash
-poetry install
-poetry run python scripts/import_learning_commons.py --grades 1 2 3 4 5 6 7 8
-poetry run python scripts/enrich_prerequisite_edges.py
-# Optional: poetry run python scripts/enrich_prerequisite_edges.py --llm
-```
+> **Rebuilding the image** (maintainers only — only needed after re-ingesting data):
+> ```bash
+> docker build -f infra/Dockerfile.neo4j -t esendashnyam/ale-neo4j:latest .
+> docker push esendashnyam/ale-neo4j:latest
+> ```
 
 ### 4. Start backend
 
