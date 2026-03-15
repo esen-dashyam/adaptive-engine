@@ -100,9 +100,23 @@ def chat_to_signal(state: AssessmentState) -> dict:
     if not state.results:
         return {"phi_signals": {}}
 
-    # Build question blocks for the prompt
+    # For open-ended assessments, score_answers already called the LLM grader
+    # and pre-populated phi_signals. Reuse those and only compute heuristics
+    # for any questions still missing (e.g. confusion-signal early-exit path).
+    existing = dict(state.phi_signals or {})
+    missing_results = [r for r in state.results if r.get("question_id") not in existing]
+    if not missing_results:
+        n_hard = sum(1 for v in existing.values() if v.get("phi", 0) < PHI_BACKPROP_THRESHOLD)
+        logger.info(
+            f"Signal Bridge: all φ pre-computed by LLM grader "
+            f"({len(existing)} questions, {n_hard} hard blocks) — skipping re-analysis"
+        )
+        for qid, sig in existing.items():
+            logger.info(f"  [{qid}] φ={sig['phi']:+.2f}  {str(sig.get('reason', ''))[:70]}")
+        return {"phi_signals": existing}
+
     blocks = []
-    for r in state.results:
+    for r in missing_results:
         qid      = r.get("question_id", "")
         chat     = r.get("chat_message", "") or ""
         time_ms  = r.get("time_ms", 0.0)
@@ -147,34 +161,37 @@ def chat_to_signal(state: AssessmentState) -> dict:
     except Exception as exc:
         logger.warning(f"chat_to_signal LLM call failed (falling back to heuristics): {exc}")
 
-    # Fill in any missing questions with heuristic φ
-    for r in state.results:
+    # Fill in any still-missing questions with heuristic φ
+    for r in missing_results:
         qid = r.get("question_id", "")
         if qid and qid not in phi_signals:
             phi_signals[qid] = _heuristic_phi(r)
+
+    # Merge with pre-computed signals from the LLM grader (existing takes priority)
+    merged = {**phi_signals, **existing}
 
     # Accumulate chat messages into session_context for longitudinal tracking
     context_entries = [
         {
             "question_id": r.get("question_id", ""),
             "chat_message": r.get("chat_message", "") or "",
-            "phi": phi_signals.get(r.get("question_id", ""), {}).get("phi", 1.0),
+            "phi": merged.get(r.get("question_id", ""), {}).get("phi", 1.0),
             "timestamp": datetime.utcnow().isoformat(),
         }
         for r in state.results
         if r.get("chat_message")
     ]
 
-    n_hard_blocks = sum(1 for v in phi_signals.values() if v["phi"] < PHI_BACKPROP_THRESHOLD)
+    n_hard_blocks = sum(1 for v in merged.values() if v["phi"] < PHI_BACKPROP_THRESHOLD)
     logger.info(
-        f"Signal Bridge: φ computed for {len(phi_signals)} questions — "
+        f"Signal Bridge: φ computed for {len(merged)} questions — "
         f"{n_hard_blocks} hard blocks (φ < {PHI_BACKPROP_THRESHOLD})"
     )
-    for qid, sig in phi_signals.items():
-        logger.info(f"  [{qid}] φ={sig['phi']:+.2f}  {sig['reason'][:70]}")
+    for qid, sig in merged.items():
+        logger.info(f"  [{qid}] φ={sig['phi']:+.2f}  {str(sig.get('reason', ''))[:70]}")
 
     return {
-        "phi_signals":     phi_signals,
+        "phi_signals":     merged,
         "session_context": state.session_context + context_entries,
     }
 
