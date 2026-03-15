@@ -207,6 +207,23 @@ After assessment results load, a Gemini-powered tutor opens automatically. The t
 
 Neo4j holds **144,733 StandardsFrameworkItem** nodes covering K–12 Mathematics and English Language Arts across all 50 US states plus CCSS Multi-State standards.
 
+**Browse it live:** [http://localhost:7474](http://localhost:7474) → login `neo4j` / `password`
+
+Useful queries:
+```cypher
+// Total curriculum nodes
+MATCH (n:StandardsFrameworkItem) RETURN count(n)
+
+// Grade 3 Math standards
+MATCH (n:StandardsFrameworkItem)
+WHERE any(g IN n.gradeLevelList WHERE g = '3') AND n.academicSubject = 'Mathematics'
+RETURN n.statementCode, n.description LIMIT 20
+
+// A student's mastery profile
+MATCH (s:Student {student_id: 'student_001'})-[r:SKILL_STATE]->(n:StandardsFrameworkItem)
+RETURN n.statementCode, r.p_mastery ORDER BY r.p_mastery DESC LIMIT 20
+```
+
 ### Node & Edge Schema
 
 | Edge type | Meaning | Weight |
@@ -398,19 +415,30 @@ curl -X POST http://localhost:8000/api/v1/assessment/evaluate \
 
 ### Prerequisites
 
-- Docker Desktop
-- Python 3.11 + Poetry
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- Python 3.11 + [Poetry](https://python-poetry.org/docs/#installation)
 - Node.js 18+
-- Gemini API key (free at aistudio.google.com) or GCP project with Vertex AI enabled
+- Gemini API key — free at [aistudio.google.com](https://aistudio.google.com/app/apikey)
+
+---
 
 ### 1. Clone and configure
 
 ```bash
-git clone <repo>
+git clone https://github.com/esen-dashyam/adaptive-engine.git
 cd adaptive-learning-engine
 cp .env.example .env
-# Fill in: GEMINI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, POSTGRES_URL
 ```
+
+Open `.env` and fill in your Gemini API key:
+
+```
+GEMINI_API_KEY=your_key_here
+```
+
+Everything else (Neo4j, Postgres) works out of the box with the defaults.
+
+---
 
 ### 2. Start databases
 
@@ -418,27 +446,50 @@ cp .env.example .env
 docker compose -f infra/compose.yaml up -d
 ```
 
-Wait ~10 seconds for Neo4j and Postgres to finish initializing before the next step.
+This pulls `esen0719/ale-neo4j:latest` from Docker Hub — a Neo4j image with the full **144,733-node curriculum graph pre-loaded**. On first boot it auto-restores the database (~30–60s). Subsequent starts are instant.
 
-### 3. Load the knowledge graph
+**Check it's ready:**
 
-The Neo4j image on Docker Hub (`esen0719/ale-neo4j:latest`) has the full 144,733-node curriculum graph pre-baked. `docker compose up` in the next step pulls it automatically — **nothing extra to do**.
+```bash
+docker logs ale-neo4j --follow
+# Wait until you see: "Remote interface available at http://localhost:7474/"
+```
 
-On first start the container auto-restores the dump into `/data`. Subsequent starts skip this and boot normally.
+**Browse the database** (optional) — open [http://localhost:7474](http://localhost:7474) in your browser:
+- Username: `neo4j`
+- Password: `password`
 
-> **Rebuilding the image** (maintainers only — only needed after re-ingesting data):
-> ```bash
-> docker build -f infra/Dockerfile.neo4j -t esen0719/ale-neo4j:latest .
-> docker push esen0719/ale-neo4j:latest
-> ```
+Try this query to confirm the data is there:
+```cypher
+MATCH (n:StandardsFrameworkItem) RETURN count(n)
+// Should return 144,736
+```
+
+---
+
+### 3. Install backend dependencies
+
+```bash
+poetry install
+```
+
+---
 
 ### 4. Start backend
+
+Run from the **project root** (not `backend/`) so `.env` is picked up:
 
 ```bash
 poetry run uvicorn backend.app.main:app --reload --port 8000 --app-dir backend
 ```
 
-> **Important:** run this from the project root (not `backend/`) so the `.env` file is picked up.
+Verify it's connected:
+```bash
+curl http://localhost:8000/health
+# {"neo4j":"connected","gemini":"configured"}
+```
+
+---
 
 ### 5. Start frontend
 
@@ -449,6 +500,14 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000)
+
+---
+
+> **Rebuilding the Neo4j image** (maintainers only — after re-ingesting data):
+> ```bash
+> docker build -f infra/Dockerfile.neo4j -t esen0719/ale-neo4j:latest .
+> docker push esen0719/ale-neo4j:latest
+> ```
 
 ---
 
