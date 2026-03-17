@@ -1,0 +1,15 @@
+{
+  "subject": "Science",
+  "grade": 6,
+  "title": "Earth Science Practice Set",
+  "problems": [
+    {"number": 1, "instruction": "What are the three main types of rocks? Give one example of each.", "content": "", "type": "short_answer", "points": 3, "answer": "Igneous (granite), Sedimentary (limestone), Metamorphic (marble)", "explanation": "Igneous rocks form from cooled magma/lava. Sedimentary form from compressed sediments. Metamorphic form from existing rocks changed by heat/pressure."},
+    {"number": 2, "instruction": "Explain the water cycle using at least 4 key terms.", "content": "", "type": "essay", "points": 5, "answer": "The water cycle includes evaporation (water turns to vapor), condensation (vapor forms clouds), precipitation (rain/snow falls), and collection (water gathers in rivers/lakes). Solar energy drives evaporation from oceans and lakes.", "explanation": "Key terms: evaporation, condensation, precipitation, collection, transpiration, runoff."},
+    {"number": 3, "instruction": "True or False: The Earth's inner core is liquid.", "content": "", "type": "true_false", "points": 1, "answer": "False", "explanation": "The inner core is solid iron and nickel. The outer core is liquid."},
+    {"number": 4, "instruction": "What causes earthquakes?", "content": "", "type": "short_answer", "points": 3, "answer": "Movement of tectonic plates", "explanation": "Earthquakes occur when tectonic plates suddenly slip past each other along fault lines, releasing stored energy as seismic waves."},
+    {"number": 5, "instruction": "Label the layers of the Earth from outermost to innermost.", "content": "", "type": "short_answer", "points": 4, "answer": "Crust, Mantle, Outer Core, Inner Core", "explanation": "The crust is the thin outer shell. The mantle is thick and semi-solid. The outer core is liquid metal. The inner core is solid metal."},
+    {"number": 6, "instruction": "What is the difference between weathering and erosion?", "content": "", "type": "short_answer", "points": 3, "answer": "Weathering breaks down rock in place; erosion moves the broken pieces to new locations.", "explanation": "Weathering is the breakdown of rock by physical or chemical processes. Erosion is the transportation of weathered material by wind, water, ice, or gravity."},
+    {"number": 7, "instruction": "A volcano erupts and lava flows down the mountain and cools. What type of rock will form?", "content": "", "type": "short_answer", "points": 2, "answer": "Igneous rock (extrusive/volcanic)", "explanation": "When lava cools on the Earth's surface, it forms extrusive igneous rock like basalt."},
+    {"number": 8, "instruction": "Which mineral would scratch glass but not topaz? Use the Mohs Hardness Scale.", "content": "Glass hardness ≈ 5.5, Topaz hardness = 8", "type": "short_answer", "points": 3, "answer": "Any mineral with hardness 6-7, such as feldspar (6) or quartz (7)", "explanation": "A mineral must be harder than 5.5 to scratch glass but softer than 8 to not scratch topaz."}
+  ]
+}

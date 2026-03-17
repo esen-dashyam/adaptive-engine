@@ -1,0 +1,15 @@
+{
+  "subject": "English Language Arts",
+  "grade": 7,
+  "title": "Literature Analysis Practice Set",
+  "problems": [
+    {"number": 1, "instruction": "Define the following literary term and give an example:", "content": "Metaphor", "type": "short_answer", "points": 3, "answer": "A metaphor is a figure of speech that directly compares two unlike things without using 'like' or 'as'. Example: 'Time is money.'", "explanation": "Unlike similes which use 'like' or 'as', metaphors make direct comparisons."},
+    {"number": 2, "instruction": "Read the following sentence and identify the point of view:", "content": "I walked into the room and immediately felt the tension.", "type": "short_answer", "points": 2, "answer": "First person", "explanation": "The use of 'I' indicates first-person point of view."},
+    {"number": 3, "instruction": "What is the difference between a protagonist and an antagonist?", "content": "", "type": "short_answer", "points": 3, "answer": "The protagonist is the main character the story follows. The antagonist is the character or force that opposes the protagonist.", "explanation": "Protagonist drives the story forward; antagonist creates conflict."},
+    {"number": 4, "instruction": "Identify the type of conflict in the following scenario:", "content": "A student must choose between attending a friend's party and studying for an important exam.", "type": "short_answer", "points": 2, "answer": "Internal conflict (character vs. self)", "explanation": "The character struggles with an internal decision rather than an external force."},
+    {"number": 5, "instruction": "What are the five elements of plot structure? List them in order.", "content": "", "type": "short_answer", "points": 5, "answer": "1. Exposition, 2. Rising Action, 3. Climax, 4. Falling Action, 5. Resolution (Denouement)", "explanation": "This is Freytag's Pyramid: the exposition introduces setting/characters, rising action builds tension, climax is the turning point, falling action shows consequences, resolution ties up loose ends."},
+    {"number": 6, "instruction": "Write a simile and a metaphor describing the ocean.", "content": "", "type": "essay", "points": 4, "answer": "Simile: The ocean roared like an angry beast. Metaphor: The ocean was a vast blue desert stretching to infinity.", "explanation": "Similes use 'like' or 'as' for comparison; metaphors state the comparison directly."},
+    {"number": 7, "instruction": "What is the theme of a story? How is it different from the plot?", "content": "", "type": "short_answer", "points": 3, "answer": "The theme is the underlying message or lesson of the story. The plot is the sequence of events that happen.", "explanation": "Theme = what the story means. Plot = what happens in the story."},
+    {"number": 8, "instruction": "Identify the figurative language used:", "content": "The wind whispered through the trees.", "type": "short_answer", "points": 2, "answer": "Personification", "explanation": "Personification gives human qualities (whispering) to non-human things (wind)."}
+  ]
+}

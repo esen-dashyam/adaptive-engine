@@ -1,0 +1,17 @@
+{
+  "subject": "Mathematics",
+  "grade": 5,
+  "title": "Fractions & Decimals Practice Set",
+  "problems": [
+    {"number": 1, "instruction": "Simplify the following fraction:", "content": "12/18", "type": "short_answer", "points": 2, "answer": "2/3", "explanation": "Divide numerator and denominator by their GCD (6): 12÷6=2, 18÷6=3."},
+    {"number": 2, "instruction": "Convert the fraction to a decimal:", "content": "3/4", "type": "short_answer", "points": 2, "answer": "0.75", "explanation": "Divide 3 by 4: 3 ÷ 4 = 0.75."},
+    {"number": 3, "instruction": "Add the following fractions:", "content": "1/3 + 1/6", "type": "short_answer", "points": 3, "answer": "1/2", "explanation": "Find common denominator (6): 2/6 + 1/6 = 3/6 = 1/2."},
+    {"number": 4, "instruction": "Which fraction is greater?", "content": "5/8 or 3/5", "type": "short_answer", "points": 2, "answer": "5/8", "explanation": "Convert to common denominator (40): 25/40 vs 24/40. 25/40 > 24/40."},
+    {"number": 5, "instruction": "Multiply the following fractions:", "content": "2/3 × 4/5", "type": "short_answer", "points": 3, "answer": "8/15", "explanation": "Multiply numerators (2×4=8) and denominators (3×5=15): 8/15."},
+    {"number": 6, "instruction": "Convert the decimal to a fraction in simplest form:", "content": "0.6", "type": "short_answer", "points": 2, "answer": "3/5", "explanation": "0.6 = 6/10 = 3/5 (divide by GCD 2)."},
+    {"number": 7, "instruction": "Subtract:", "content": "7/8 - 1/4", "type": "short_answer", "points": 3, "answer": "5/8", "explanation": "Convert 1/4 to 2/8: 7/8 - 2/8 = 5/8."},
+    {"number": 8, "instruction": "A recipe calls for 2/3 cup of flour. If you want to make half the recipe, how much flour do you need?", "content": "", "type": "word_problem", "points": 4, "answer": "1/3 cup", "explanation": "Half of 2/3 = (1/2) × (2/3) = 2/6 = 1/3 cup."},
+    {"number": 9, "instruction": "Order from least to greatest:", "content": "0.45, 1/2, 0.4, 2/5", "type": "short_answer", "points": 3, "answer": "2/5, 0.4, 0.45, 1/2", "explanation": "Convert all to decimals: 2/5=0.4, 0.4, 0.45, 1/2=0.5. Order: 0.4, 0.4, 0.45, 0.5. Since 2/5=0.4, they are equal."},
+    {"number": 10, "instruction": "Divide:", "content": "3/4 ÷ 1/2", "type": "short_answer", "points": 3, "answer": "3/2 or 1 1/2", "explanation": "Multiply by reciprocal: 3/4 × 2/1 = 6/4 = 3/2 = 1 1/2."}
+  ]
+}

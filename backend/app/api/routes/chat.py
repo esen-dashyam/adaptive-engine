@@ -628,8 +628,9 @@ def _build_system_from_mastery(
         for g, v in sorted(grade_bk.items())
     ]
 
+    student_name = ctx.get("student_name") or student_id
     sections = [
-        f"You are an expert, encouraging AI tutor for {student_id}, a {grade_label} {subject_name} student.",
+        f"You are an expert, encouraging AI tutor for {student_name}, a {grade_label} {subject_name} student.",
         "You have direct access to this student's live mastery data from the knowledge graph.",
         f"Standards assessed: {coverage} | Mean mastery: {round((mean_m or 0)*100)}%",
         "",

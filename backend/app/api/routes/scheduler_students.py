@@ -48,7 +48,7 @@ async def get_student(student_id: str) -> dict[str, Any]:
 @router.get("/{student_id}/stats", summary="Check-in statistics")
 async def get_checkin_stats(student_id: str) -> dict[str, Any]:
     """Return check-in completion stats for a student."""
-    from datetime import date, timedelta
+    from datetime import date, timedelta, datetime
 
     try:
         sb = get_supabase()
@@ -68,15 +68,18 @@ async def get_checkin_stats(student_id: str) -> dict[str, Any]:
                 "pending": 0, "rescheduled": 0,
                 "completion_rate": 0.0, "streak": 0,
                 "week_completed": 0, "week_total": 0,
+                "unique_days_completed": 0, "week_hours": 0.0,
             }
 
         today = date.today()
+        schedule_ids = [sch["id"] for sch in schedules]
+
         all_sessions = []
-        for sch in schedules:
+        for sid in schedule_ids:
             resp = (
                 sb.table("session_instances")
                 .select("*")
-                .eq("schedule_id", sch["id"])
+                .eq("schedule_id", sid)
                 .lte("session_date", str(today))
                 .order("session_date", desc=True)
                 .execute()
@@ -91,6 +94,11 @@ async def get_checkin_stats(student_id: str) -> dict[str, Any]:
 
         past_total = total - pending
         completion_rate = completed / past_total if past_total > 0 else 0.0
+
+        # Unique school days (distinct dates with ≥1 completed session)
+        unique_days_completed = len({
+            s["session_date"] for s in all_sessions if s["status"] == "completed"
+        })
 
         # Current streak
         streak = 0
@@ -114,6 +122,30 @@ async def get_checkin_stats(student_id: str) -> dict[str, Any]:
         week_completed = sum(1 for s in week_sessions if s["status"] == "completed")
         week_total = len(week_sessions)
 
+        # Week hours: sum actual slot durations for completed sessions this week
+        week_hours = 0.0
+        completed_week_slots = [
+            s["schedule_slot_id"] for s in week_sessions
+            if s["status"] == "completed" and s.get("schedule_slot_id")
+        ]
+        if completed_week_slots:
+            # Fetch slot durations
+            slot_map: dict[str, float] = {}
+            for sid in schedule_ids:
+                slots = (
+                    sb.table("schedule_slots")
+                    .select("id, start_time, end_time")
+                    .eq("schedule_id", sid)
+                    .execute()
+                    .data
+                )
+                for sl in slots:
+                    t0 = datetime.strptime(sl["start_time"], "%H:%M:%S")
+                    t1 = datetime.strptime(sl["end_time"], "%H:%M:%S")
+                    slot_map[sl["id"]] = (t1 - t0).total_seconds() / 3600.0
+            for slot_id in completed_week_slots:
+                week_hours += slot_map.get(slot_id, 0.75)  # default 45 min
+
         return {
             "total": total,
             "completed": completed,
@@ -124,6 +156,8 @@ async def get_checkin_stats(student_id: str) -> dict[str, Any]:
             "streak": streak,
             "week_completed": week_completed,
             "week_total": week_total,
+            "unique_days_completed": unique_days_completed,
+            "week_hours": round(week_hours, 1),
         }
     except Exception as exc:
         logger.error("Failed to get stats for {}: {}", student_id, exc)

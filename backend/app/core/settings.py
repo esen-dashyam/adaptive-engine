@@ -64,5 +64,8 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_key: str = ""
 
+    # ── YouTube Data API v3 ───────────────────────────────
+    youtube_api_key: str = ""
+
 
 settings = Settings()
