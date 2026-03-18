@@ -578,13 +578,47 @@ async def get_student_context(
             for r in rows_subset
         ]
 
+    formatted_gaps = _fmt(gaps)
+
+    # Pre-compute short labels for gaps using Gemini (best-effort)
+    try:
+        from backend.app.core.settings import settings as _s
+        if _s.gemini_api_key and formatted_gaps:
+            import json as _json
+            from google import genai as _genai
+            from google.genai import types as _types
+
+            descs = [g["description"] for g in formatted_gaps]
+            numbered = "\n".join(f"{i+1}. {d}" for i, d in enumerate(descs))
+            prompt = (
+                "Convert each educational standard description into a SHORT topic name (2-4 words). "
+                "Return a JSON array of strings in the same order.\n\n" + numbered
+            )
+            _client = _genai.Client(api_key=_s.gemini_api_key)
+            _resp = _client.models.generate_content(
+                model=_s.gemini_model,
+                contents=prompt,
+                config=_types.GenerateContentConfig(
+                    temperature=0.1, response_mime_type="application/json",
+                ),
+            )
+            _text = (_resp.text or "").strip()
+            if _text.startswith("```"):
+                _text = _text.split("\n", 1)[1].rsplit("```", 1)[0]
+            labels = _json.loads(_text)
+            if isinstance(labels, list) and len(labels) == len(formatted_gaps):
+                for i, g in enumerate(formatted_gaps):
+                    g["short_label"] = labels[i]
+    except Exception as exc:
+        logger.debug(f"Short label generation failed: {exc}")
+
     return {
         "student_id":     student_id,
         "has_history":    True,
         "total_assessed": len(rows),
         "total_in_kg":    total_in_kg,
         "mean_mastery":   mean_m,
-        "gaps":           _fmt(gaps),
+        "gaps":           formatted_gaps,
         "strengths":      _fmt(strengths),
         "recent":         _fmt(recent),
         "grade_breakdown": grade_summary,
@@ -628,8 +662,9 @@ def _build_system_from_mastery(
         for g, v in sorted(grade_bk.items())
     ]
 
+    student_name = ctx.get("student_name") or student_id
     sections = [
-        f"You are an expert, encouraging AI tutor for {student_id}, a {grade_label} {subject_name} student.",
+        f"You are an expert, encouraging AI tutor for {student_name}, a {grade_label} {subject_name} student.",
         "You have direct access to this student's live mastery data from the knowledge graph.",
         f"Standards assessed: {coverage} | Mean mastery: {round((mean_m or 0)*100)}%",
         "",
