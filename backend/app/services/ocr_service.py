@@ -24,17 +24,17 @@ class OCRResult:
 
 # ── Gemini Vision extraction ─────────────────────────────
 
-HANDWRITING_PROMPT = """You are an OCR system specialized in reading handwritten student work.
+HANDWRITING_PROMPT = """You are an OCR system that extracts text from images.
 
-Examine this image of a student's handwritten homework or quiz answers.
+Examine this image and extract ALL visible text — both printed and handwritten.
 
 Instructions:
-1. Extract ALL handwritten text exactly as written by the student.
-2. Preserve the structure: if answers are numbered, keep the numbering.
+1. Extract ALL text exactly as it appears in the image.
+2. Preserve the structure: keep headings, numbering, bullet points, and layout.
 3. If there are math expressions, represent them in a readable text format (e.g., "3/4 + 1/2 = 5/4").
 4. If a word or number is unclear, provide your best guess with [?] after it.
-5. Separate distinct answers or sections with blank lines.
-6. Do NOT add any commentary, grading, or corrections — just transcribe what is written.
+5. Separate distinct sections with blank lines.
+6. Do NOT add any commentary or interpretation — just transcribe what is visible.
 
 Return ONLY the transcribed text, nothing else."""
 
@@ -54,7 +54,9 @@ def extract_with_gemini_vision(image_bytes: bytes, mime_type: str) -> OCRResult:
         config=types.GenerateContentConfig(temperature=0.1),
     )
 
-    text = resp.text.strip()
+    text = (resp.text or "").strip()
+    if not text:
+        return OCRResult(text="", confidence=0.0, method="gemini_vision")
     return OCRResult(text=text, confidence=92.0, method="gemini_vision")
 
 
