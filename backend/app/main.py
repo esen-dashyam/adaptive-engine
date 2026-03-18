@@ -31,6 +31,7 @@ from backend.app.api.routes.scheduler_pdf import router as sched_pdf_router
 from backend.app.api.routes.scheduler_quiz import router as sched_quiz_router
 from backend.app.api.routes.scheduler_ocr import router as sched_ocr_router
 from backend.app.api.routes.scheduler_chat import router as sched_chat_router
+from backend.app.api.routes.scheduler_games import router as sched_games_router
 
 
 @asynccontextmanager
@@ -96,6 +97,7 @@ app.include_router(sched_pdf_router,      prefix=settings.api_prefix)
 app.include_router(sched_quiz_router,     prefix=settings.api_prefix)
 app.include_router(sched_ocr_router,      prefix=settings.api_prefix)
 app.include_router(sched_chat_router,     prefix=settings.api_prefix)
+app.include_router(sched_games_router,    prefix=settings.api_prefix)
 
 
 @app.get("/", tags=["Health"])
