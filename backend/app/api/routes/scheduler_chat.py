@@ -41,6 +41,60 @@ Guidelines:
 - Use English by default, but respond in the student's language if they write in another language"""
 
 
+@router.post("/shorten-labels", summary="Shorten gap descriptions to concise topic labels")
+async def shorten_labels(body: dict) -> dict:
+    """Take a list of verbose standard descriptions and return short 2-4 word labels.
+
+    Body: { "descriptions": ["Use place value understanding to round...", ...] }
+    Returns: { "labels": ["Rounding whole numbers", ...] }
+    """
+    descriptions = body.get("descriptions", [])
+    if not descriptions:
+        return {"labels": []}
+    if not settings.gemini_api_key:
+        # Fallback: first 5 words
+        return {"labels": [" ".join(d.split()[:5]) for d in descriptions]}
+
+    try:
+        from google import genai
+        from google.genai import types
+        import json
+
+        numbered = "\n".join(f"{i+1}. {d}" for i, d in enumerate(descriptions))
+        prompt = f"""Convert each educational standard description below into a SHORT topic name (2-4 words).
+Examples:
+- "Use place value understanding to round whole numbers to the nearest 10 or 100." → "Rounding whole numbers"
+- "Apply and extend previous understandings of division to divide unit fractions" → "Fraction division"
+- "Gather and make sense of information to describe that light travels" → "Light & travel"
+- "Use numbers expressed in the form of a single digit times an integer power of 10" → "Scientific notation"
+
+Now convert these:
+{numbered}
+
+Return a JSON array of strings, one per input, in the same order. ONLY the JSON array, nothing else."""
+
+        client = genai.Client(api_key=settings.gemini_api_key)
+        resp = client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        text = (resp.text or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        labels = json.loads(text)
+        if isinstance(labels, list) and len(labels) == len(descriptions):
+            return {"labels": labels}
+    except Exception as e:
+        logger.warning("shorten-labels failed: %s", e)
+
+    # Fallback
+    return {"labels": [" ".join(d.split()[:4]) for d in descriptions]}
+
+
 @router.post("/ask", summary="Ask AI a question")
 async def ask_ai(req: AskRequest) -> AskResponse:
     """Send a message to the AI tutor and get a response."""
