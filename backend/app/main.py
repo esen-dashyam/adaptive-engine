@@ -9,9 +9,12 @@ Focused stack:
 """
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
 
 from backend.app.core.settings import settings
@@ -81,6 +84,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class NoCacheGamesMiddleware(BaseHTTPMiddleware):
+    """Disable browser caching for game static files so updates are picked up."""
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        if request.url.path.startswith("/static/games/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+app.add_middleware(NoCacheGamesMiddleware)
+
 app.include_router(assessment_router, prefix=settings.api_prefix)
 app.include_router(students_router,   prefix=settings.api_prefix)
 app.include_router(rag_router,        prefix=settings.api_prefix)
@@ -98,6 +114,13 @@ app.include_router(sched_quiz_router,     prefix=settings.api_prefix)
 app.include_router(sched_ocr_router,      prefix=settings.api_prefix)
 app.include_router(sched_chat_router,     prefix=settings.api_prefix)
 app.include_router(sched_games_router,    prefix=settings.api_prefix)
+
+
+# Serve game HTML5 exports as static files
+_static_games = Path(__file__).resolve().parent.parent / "static" / "games"
+if _static_games.is_dir():
+    app.mount("/static/games", StaticFiles(directory=str(_static_games), html=True), name="games")
+    logger.info(f"Static games mounted from {_static_games}")
 
 
 @app.get("/", tags=["Health"])

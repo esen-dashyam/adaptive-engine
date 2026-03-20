@@ -16,7 +16,7 @@ router = APIRouter(prefix="/scheduler/games", tags=["Scheduler — Games"])
 
 
 class GameConfigRequest(BaseModel):
-    game_type: str = "star_blaster"  # star_blaster | quiz_dungeon | vocab_match | etc
+    game_type: str = "star_blaster"  # star_blaster | tower_defense | quiz_dungeon | vocab_match
     topic: str = "Fractions"
     subject: str = "Math"
     grade: int = 5
@@ -60,6 +60,30 @@ Return a JSON object:
 Rules:
 - Terms and definitions should be age-appropriate
 - Definitions should be concise (under 10 words)
+- Return ONLY valid JSON""",
+
+    "tower_defense": """Generate {num_questions} multiple-choice questions about "{topic}" for a Grade {grade} {subject} student, formatted for a tower defense strategy game.
+
+Return a JSON object:
+{{
+  "title": "Tower Defense: {topic}",
+  "waves": [
+    {{
+      "question": "question text",
+      "correct": "correct answer",
+      "wrong": ["wrong1", "wrong2", "wrong3"],
+      "enemies": 5,
+      "enemy_speed": 60
+    }}
+  ]
+}}
+
+Rules:
+- Age-appropriate for Grade {grade}
+- Each question has exactly 1 correct answer and 3 wrong answers
+- Keep answers short (1-4 words)
+- Progressively harder: early waves have fewer/slower enemies, later waves have more/faster
+- enemies range from 3 to 8, enemy_speed from 50 to 100
 - Return ONLY valid JSON""",
 
     "quiz_dungeon": """Generate {num_questions} multiple-choice questions about "{topic}" for a Grade {grade} {subject} student, formatted for a dungeon RPG game.

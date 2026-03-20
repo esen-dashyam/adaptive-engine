@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
 
     # CORS
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:3003,http://localhost:3004,http://localhost:3005,http://localhost:5173"
 
     # Neo4j
     neo4j_uri: str = Field(default="bolt://localhost:7687")
