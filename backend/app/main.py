@@ -35,6 +35,8 @@ from backend.app.api.routes.scheduler_quiz import router as sched_quiz_router
 from backend.app.api.routes.scheduler_ocr import router as sched_ocr_router
 from backend.app.api.routes.scheduler_chat import router as sched_chat_router
 from backend.app.api.routes.scheduler_games import router as sched_games_router
+from backend.app.api.routes.scheduler_screen_time import router as sched_screen_time_router
+from backend.app.api.routes.parent_chat import router as parent_chat_router
 
 
 @asynccontextmanager
@@ -114,6 +116,8 @@ app.include_router(sched_quiz_router,     prefix=settings.api_prefix)
 app.include_router(sched_ocr_router,      prefix=settings.api_prefix)
 app.include_router(sched_chat_router,     prefix=settings.api_prefix)
 app.include_router(sched_games_router,    prefix=settings.api_prefix)
+app.include_router(sched_screen_time_router, prefix=settings.api_prefix)
+app.include_router(parent_chat_router,       prefix=settings.api_prefix)
 
 
 # Serve game HTML5 exports as static files
