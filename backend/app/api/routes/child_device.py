@@ -7,6 +7,7 @@ POST /api/v1/parent/device-action — Parent sends an action to child's device
 """
 from __future__ import annotations
 
+import random
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -20,6 +21,7 @@ router = APIRouter(tags=["Child Device"])
 # In-memory store (replace with Supabase table later)
 _registered_children: dict[str, dict] = {}
 _pending_actions: list[dict] = []
+_pairing_codes: dict[str, str] = {}  # code -> child_id
 
 
 # ── Models ──
@@ -28,6 +30,10 @@ class ChildRegisterRequest(BaseModel):
     child_id: str
     child_name: str
     device_name: str = "iPhone"
+
+
+class PairRequest(BaseModel):
+    code: str
 
 
 class DeviceActionRequest(BaseModel):
@@ -40,6 +46,12 @@ class DeviceActionRequest(BaseModel):
 
 @router.post("/child/register", summary="Register a child device")
 async def register_child(req: ChildRegisterRequest) -> dict:
+    # Generate a 6-digit pairing code
+    code = str(random.randint(100000, 999999))
+    # Ensure unique
+    while code in _pairing_codes:
+        code = str(random.randint(100000, 999999))
+
     _registered_children[req.child_id] = {
         "child_id": req.child_id,
         "child_name": req.child_name,
@@ -47,8 +59,9 @@ async def register_child(req: ChildRegisterRequest) -> dict:
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
-    logger.info("Child device registered: {} ({})", req.child_name, req.child_id)
-    return {"status": "registered", "child_id": req.child_id}
+    _pairing_codes[code] = req.child_id
+    logger.info("Child device registered: {} ({}) — pairing code: {}", req.child_name, req.child_id, code)
+    return {"status": "registered", "child_id": req.child_id, "pairing_code": code}
 
 
 @router.get("/child/pending-actions/{child_id}", summary="Poll for pending actions")
@@ -77,6 +90,24 @@ async def acknowledge_action(action_id: str) -> dict:
 
 
 # ── Parent endpoint ──
+
+@router.post("/parent/pair", summary="Pair with child device using code")
+async def pair_with_child(req: PairRequest) -> dict:
+    child_id = _pairing_codes.get(req.code)
+    if not child_id:
+        raise HTTPException(status_code=404, detail="Invalid pairing code")
+
+    child = _registered_children.get(child_id)
+    if not child:
+        raise HTTPException(status_code=404, detail="Child device not found")
+
+    logger.info("Parent paired with child {} via code {}", child_id, req.code)
+    return {
+        "status": "paired",
+        "child_id": child_id,
+        "child_name": child.get("child_name", ""),
+    }
+
 
 @router.post("/parent/device-action", summary="Send action to child device")
 async def send_device_action(req: DeviceActionRequest) -> dict:
