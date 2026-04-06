@@ -92,10 +92,11 @@ async def send_device_action(req: DeviceActionRequest) -> dict:
     _pending_actions.append(action)
     logger.info("Action queued for {}: {} ({})", req.child_id, req.action_type, action_id)
 
-    # Cleanup old acknowledged actions (keep last 50)
-    global _pending_actions
-    _pending_actions = [a for a in _pending_actions if not a.get("acknowledged")] + \
-                       [a for a in _pending_actions if a.get("acknowledged")][-10:]
+    # Cleanup old acknowledged actions
+    acknowledged = [a for a in _pending_actions if a.get("acknowledged")]
+    if len(acknowledged) > 10:
+        for old in acknowledged[:-10]:
+            _pending_actions.remove(old)
 
     return {"status": "queued", "action_id": action_id}
 
