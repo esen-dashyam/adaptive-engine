@@ -96,6 +96,8 @@ async def create_family(
 class PairRequest(BaseModel):
     code: str
     parent_device_label: str = "Parent's iPhone"
+    # Parent's chosen protection level overrides the placeholder the child set.
+    protection_mode: ProtectionMode | None = None
 
 
 class PairResponse(BaseModel):
@@ -133,9 +135,19 @@ async def pair(req: PairRequest, session: AsyncSession = Depends(get_async_sessi
     if child_device is None:
         raise HTTPException(500, "child device missing for this family")
 
+    # Apply parent's protection choice if provided (overrides child's default)
+    if req.protection_mode is not None:
+        pairing.protection_mode = req.protection_mode
+        family_row = await session.get(Family, pairing.family_id)
+        if family_row is not None:
+            family_row.protection_mode = req.protection_mode
+
     await session.flush()
 
-    logger.info("Parent device {} paired into family {}", parent_device.id, pairing.family_id)
+    logger.info(
+        "Parent device {} paired into family {} (mode={})",
+        parent_device.id, pairing.family_id, pairing.protection_mode,
+    )
 
     return PairResponse(
         family_id=pairing.family_id,
