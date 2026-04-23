@@ -1,8 +1,8 @@
 """Family — endpoints for pairing a parent device + child device into an Evlin family.
 
-POST /api/v1/family/create           — Parent creates a family, gets pairing code
-POST /api/v1/family/pair             — Child enters code, joins family
-GET  /api/v1/family/pairing-status   — Parent polls for child join
+POST /api/v1/family/create           — Child creates a family, gets pairing code to show
+POST /api/v1/family/pair             — Parent enters code, joins family
+GET  /api/v1/family/pairing-status   — Child polls for parent join
 GET  /api/v1/family/auth-status      — Parent polls for `.child` auth granted
 POST /api/v1/family/auth-status/grant — Child posts after .child auth succeeds
 POST /api/v1/family/saved-lists      — Either device saves list metadata
@@ -31,17 +31,16 @@ router = APIRouter(prefix="/family", tags=["Evlin Family"])
 
 
 # ---------- /family/create ----------
+# Child initiates family: creates family + child device + pairing code.
 
 class CreateFamilyRequest(BaseModel):
-    child_name: str
-    child_age: int | None = None
-    protection_mode: ProtectionMode
-    parent_device_label: str = "Parent's iPhone"
+    child_device_label: str = "Child's iPhone"
+    protection_mode: ProtectionMode = ProtectionMode.std
 
 
 class CreateFamilyResponse(BaseModel):
     family_id: uuid.UUID
-    parent_device_id: uuid.UUID
+    child_device_id: uuid.UUID
     pairing_code: str
     code_expires_at: datetime
 
@@ -50,7 +49,7 @@ def _gen_code() -> str:
     return "".join(str(random.randint(0, 9)) for _ in range(6))
 
 
-@router.post("/create", response_model=CreateFamilyResponse, summary="Parent creates a family")
+@router.post("/create", response_model=CreateFamilyResponse, summary="Child initiates family + gets pairing code")
 async def create_family(
     req: CreateFamilyRequest,
     session: AsyncSession = Depends(get_async_session),
@@ -59,15 +58,16 @@ async def create_family(
     session.add(family)
     await session.flush()
 
-    parent_device = Device(
+    child_device = Device(
         family_id=family.id,
-        mode=DeviceMode.parent,
-        label=req.parent_device_label,
+        mode=DeviceMode.child,
+        label=req.child_device_label,
     )
-    session.add(parent_device)
+    session.add(child_device)
     await session.flush()
 
-    # Retry on the extremely unlikely collision (1 in 1M)
+    # Retry on the extremely unlikely collision
+    code = ""
     for _ in range(5):
         code = _gen_code()
         existing = await session.get(PairingCode, code)
@@ -80,31 +80,32 @@ async def create_family(
     session.add(pairing)
     await session.flush()
 
-    logger.info("Evlin family {} created for child={} mode={}", family.id, req.child_name, req.protection_mode)
+    logger.info("Evlin family {} created by child device {} mode={}", family.id, child_device.id, req.protection_mode)
 
     return CreateFamilyResponse(
         family_id=family.id,
-        parent_device_id=parent_device.id,
+        child_device_id=child_device.id,
         pairing_code=code,
         code_expires_at=pairing.expires_at,
     )
 
 
 # ---------- /family/pair ----------
+# Parent joins an existing family by entering the code the child showed.
 
 class PairRequest(BaseModel):
     code: str
-    device_label: str = "Child's iPhone"
+    parent_device_label: str = "Parent's iPhone"
 
 
 class PairResponse(BaseModel):
     family_id: uuid.UUID
-    child_device_id: uuid.UUID
     parent_device_id: uuid.UUID
+    child_device_id: uuid.UUID
     protection_mode: ProtectionMode
 
 
-@router.post("/pair", response_model=PairResponse, summary="Child pairs into a family")
+@router.post("/pair", response_model=PairResponse, summary="Parent enters code to join family")
 async def pair(req: PairRequest, session: AsyncSession = Depends(get_async_session)) -> PairResponse:
     pairing = await session.get(PairingCode, req.code)
     if not pairing:
@@ -112,64 +113,64 @@ async def pair(req: PairRequest, session: AsyncSession = Depends(get_async_sessi
     if pairing.used:
         raise HTTPException(400, "pairing code already used")
 
-    # Compare both sides as timezone-aware UTC (pairing.expires_at is TZ-aware from model)
     now = datetime.now(timezone.utc)
     if pairing.expires_at < now:
         raise HTTPException(400, "pairing code expired")
 
-    child_device = Device(
+    parent_device = Device(
         family_id=pairing.family_id,
-        mode=DeviceMode.child,
-        label=req.device_label,
+        mode=DeviceMode.parent,
+        label=req.parent_device_label,
     )
-    session.add(child_device)
+    session.add(parent_device)
     pairing.used = True
 
-    parent_stmt = select(Device).where(
+    child_stmt = select(Device).where(
         Device.family_id == pairing.family_id,
-        Device.mode == DeviceMode.parent,
+        Device.mode == DeviceMode.child,
     )
-    parent_device = (await session.execute(parent_stmt)).scalar_one_or_none()
-    if parent_device is None:
-        raise HTTPException(500, "parent device missing for this family")
+    child_device = (await session.execute(child_stmt)).scalar_one_or_none()
+    if child_device is None:
+        raise HTTPException(500, "child device missing for this family")
 
     await session.flush()
 
-    logger.info("Device {} paired into family {}", child_device.id, pairing.family_id)
+    logger.info("Parent device {} paired into family {}", parent_device.id, pairing.family_id)
 
     return PairResponse(
         family_id=pairing.family_id,
-        child_device_id=child_device.id,
         parent_device_id=parent_device.id,
+        child_device_id=child_device.id,
         protection_mode=pairing.protection_mode,
     )
 
 
 # ---------- /family/pairing-status ----------
+# Child polls this while displaying the code to know when parent has joined.
 
 class PairingStatusResponse(BaseModel):
     code: str
     used: bool
-    child_device_id: uuid.UUID | None
+    parent_device_id: uuid.UUID | None
 
 
-@router.get("/pairing-status", response_model=PairingStatusResponse, summary="Parent polls for child join")
+@router.get("/pairing-status", response_model=PairingStatusResponse, summary="Child polls for parent join")
 async def pairing_status(code: str, session: AsyncSession = Depends(get_async_session)) -> PairingStatusResponse:
     pairing = await session.get(PairingCode, code)
     if not pairing:
         raise HTTPException(404, "pairing code not found")
 
-    child_id: uuid.UUID | None = None
+    parent_id: uuid.UUID | None = None
     if pairing.used:
         stmt = select(Device).where(
             Device.family_id == pairing.family_id,
-            Device.mode == DeviceMode.child,
+            Device.mode == DeviceMode.parent,
         )
-        child = (await session.execute(stmt)).scalar_one_or_none()
-        if child:
-            child_id = child.id
+        parent = (await session.execute(stmt)).scalar_one_or_none()
+        if parent:
+            parent_id = parent.id
 
-    return PairingStatusResponse(code=code, used=pairing.used, child_device_id=child_id)
+    return PairingStatusResponse(code=code, used=pairing.used, parent_device_id=parent_id)
 
 
 # ---------- /family/auth-status ----------
