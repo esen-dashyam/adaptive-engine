@@ -30,6 +30,33 @@ from backend.app.db.models.saved_list import SavedListMeta, SavedListMode
 router = APIRouter(prefix="/family", tags=["Evlin Family"])
 
 
+# ---------- Admin: force-create tables ----------
+# One-shot endpoint for when startup table creation silently failed.
+# Safe to call anytime — `create_all` is idempotent.
+
+@router.post("/__init_tables", summary="Force-create Evlin tables (admin)")
+async def init_tables() -> dict:
+    try:
+        from backend.app.db.engine import create_all_tables
+        await create_all_tables()
+        # Verify by listing tables
+        from backend.app.db.engine import _engine, _init
+        from sqlalchemy import text
+        _init()
+        async with _engine.begin() as conn:  # type: ignore[union-attr]
+            result = await conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name LIKE 'evlin_%' "
+                "ORDER BY table_name"
+            ))
+            tables = [row[0] for row in result.all()]
+        return {"ok": True, "evlin_tables": tables}
+    except Exception as exc:
+        import traceback
+        logger.error("init_tables failed: {}\n{}", exc, traceback.format_exc())
+        return {"ok": False, "error": str(exc), "traceback": traceback.format_exc().splitlines()[-15:]}
+
+
 # ---------- /family/create ----------
 # Child initiates family: creates family + child device + pairing code.
 
