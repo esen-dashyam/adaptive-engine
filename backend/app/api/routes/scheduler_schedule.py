@@ -186,6 +186,69 @@ async def get_sessions_range(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+class SlotCheckInRequest(BaseModel):
+    slot_id: str
+    date: str  # YYYY-MM-DD
+    notes: str | None = None
+
+
+@router.post("/slots/checkin", summary="Check in by slot + date (auto-creates session)")
+async def checkin_by_slot(body: SlotCheckInRequest) -> dict[str, Any]:
+    """Check in using slot_id + date. Creates session_instance if it doesn't exist."""
+    from datetime import datetime, timezone
+
+    try:
+        sb = get_supabase()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Check if session already exists
+        existing = (
+            sb.table("session_instances")
+            .select("*")
+            .eq("schedule_slot_id", body.slot_id)
+            .eq("session_date", body.date)
+            .execute()
+        )
+
+        if existing.data:
+            # Session exists — just update it
+            session = existing.data[0]
+            result = (
+                sb.table("session_instances")
+                .update({"status": "completed", "checked_in_at": now, "notes": body.notes})
+                .eq("id", session["id"])
+                .execute()
+            )
+            return result.data[0]
+        else:
+            # Create new session and mark completed
+            # Look up schedule_id from the slot
+            slot = sb.table("schedule_slots").select("schedule_id,start_time,end_time").eq("id", body.slot_id).execute()
+            if not slot.data:
+                raise HTTPException(status_code=404, detail="Slot not found")
+
+            result = (
+                sb.table("session_instances")
+                .insert({
+                    "schedule_id": slot.data[0]["schedule_id"],
+                    "schedule_slot_id": body.slot_id,
+                    "session_date": body.date,
+                    "start_time": slot.data[0]["start_time"],
+                    "end_time": slot.data[0]["end_time"],
+                    "status": "completed",
+                    "checked_in_at": now,
+                    "notes": body.notes,
+                })
+                .execute()
+            )
+            return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Slot check-in failed: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/sessions/{session_id}/checkin", summary="Check in to a session")
 async def check_in_session(
     session_id: str,
@@ -221,6 +284,39 @@ async def check_in_session(
         raise
     except Exception as exc:
         logger.error("Failed to check in session {}: {}", session_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/sessions/{session_id}/undo-checkin", summary="Undo a check-in")
+async def undo_checkin(session_id: str) -> dict[str, Any]:
+    """Revert a completed session back to pending (取消打卡)."""
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("session_instances")
+            .update({"status": "pending", "checked_in_at": None, "notes": None})
+            .eq("id", session_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Log undo — best effort (checkin_log constraint may not include this action)
+        try:
+            sb.table("checkin_log").insert({
+                "session_instance_id": session_id,
+                "action": "check_in",  # reuse allowed action value
+                "performed_by": "parent",
+                "details": {"undo": True},
+            }).execute()
+        except Exception:
+            logger.warning("Could not log undo for session {}", session_id)
+
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to undo check-in for {}: {}", session_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
