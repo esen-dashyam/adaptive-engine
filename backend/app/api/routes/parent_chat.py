@@ -339,10 +339,46 @@ async def parent_chat(
                 ),
             )
 
+    # Resolve list_id for savedList-tier actions. Dispatcher only has names; the
+    # child executor requires the UUID for recordKey stability (spec §3.2) and
+    # will throw ExecuteError.malformed if list_id is missing. We look up the
+    # SavedListMeta row by (family_id, name) here.
+    resolved_list_id: str | None = result.resolved.list_id
+    if (
+        resolved_list_id is None
+        and result.resolved.tier == "savedList"
+        and result.resolved.list_name is not None
+        and req.family_id is not None
+    ):
+        list_row_stmt = select(SavedListMeta.id).where(
+            SavedListMeta.family_id == req.family_id,
+            SavedListMeta.name == result.resolved.list_name,
+        )
+        list_row = (await session.execute(list_row_stmt)).scalar_one_or_none()
+        if list_row is not None:
+            resolved_list_id = str(list_row)
+        else:
+            # Backend metadata row missing — surface clearly instead of silently
+            # queueing a command the child will reject.
+            logger.warning(
+                "Saved list '{}' not found for family {} — returning E4",
+                result.resolved.list_name, req.family_id,
+            )
+            return ChatResponse(
+                message=_card_transition_message("E4", result.resolved.list_name, None),
+                reasoning=reasoning,
+                action=ChatAction(
+                    type=result.resolved.action,
+                    confirmation_required=True,
+                    card_id="E4",
+                    target_display=result.resolved.list_name,
+                ),
+            )
+
     payload_target: dict[str, Any] = {
         "bundle_id": result.resolved.bundle_id,
         "list_name": result.resolved.list_name,
-        "list_id": result.resolved.list_id,
+        "list_id": resolved_list_id,
         "category_hint": result.resolved.category_hint,
         "target_all": result.resolved.target_all,
         "target_child_id": str(target_child.id),
