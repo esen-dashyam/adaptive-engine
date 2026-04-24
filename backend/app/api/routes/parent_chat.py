@@ -323,14 +323,19 @@ async def parent_chat(
                 target_child = matches[0]
         if target_child is None:
             # Multi-child + (no hint OR hint ambiguous) → ask the parent.
+            # Same message-override logic as the dispatcher-side card path:
+            # don't let Gemini's "I'll shield X" reply contradict the D4 card.
+            display = _canonical_display(result.resolved.target_display)
+            transition = _card_transition_message("D4", display, result.resolved.duration_minutes)
             return ChatResponse(
-                message=message,
+                message=transition,
                 reasoning=reasoning,
                 action=ChatAction(
                     type=result.resolved.action,
                     confirmation_required=True,
                     card_id="D4",
-                    target_display=result.resolved.target_display,
+                    target_display=display,
+                    duration_minutes=result.resolved.duration_minutes,
                 ),
             )
 

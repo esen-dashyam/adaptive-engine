@@ -88,7 +88,7 @@ def dispatch(
     elif action_type == "unblock":
         result = _route_unblock(protection_mode, gemini_action)
     elif action_type == "unblock_all":
-        result = _route_unblock_all(protection_mode)
+        result = _route_unblock_all(protection_mode, force_confirmations)
     elif action_type == "shield":
         result = _route_shield(protection_mode, saved_list_names, gemini_action, force_confirmations)
     elif action_type == "unshield":
@@ -156,8 +156,12 @@ def _route_unblock(mode: str, action: dict) -> DispatchResult:
     )
 
 
-def _route_unblock_all(mode: str) -> DispatchResult:
-    # Spec D5: always A3 card, in both modes.
+def _route_unblock_all(mode: str, force_confirmations: list[str] | None = None) -> DispatchResult:
+    # Spec D5: unblock_all works in BOTH modes but always requires confirmation.
+    # Parent's A3-card Confirm re-submits with force_confirmations=["A3"], which
+    # bypasses the guard and queues the actual unblock_all command.
+    if force_confirmations and "A3" in force_confirmations:
+        return DispatchResult(resolved=ResolvedAction(action="unblock_all", tier=None))
     return DispatchResult(requires_card="A3")
 
 
@@ -168,6 +172,7 @@ def _route_shield(
     force_confirmations: list[str] | None = None,
 ) -> DispatchResult:
     force_downgrade = bool(force_confirmations and "B1" in force_confirmations)
+    skip_long_duration_guard = bool(force_confirmations and "D3" in force_confirmations)
     kind = action.get("target_kind_hint")
     target = action.get("target_request", "")
     duration = action.get("duration_minutes")
@@ -176,8 +181,9 @@ def _route_shield(
     if duration == "missing":
         return DispatchResult(requires_card="D1")
 
-    # D3: long duration (>24h)
-    if isinstance(duration, int) and duration > 24 * 60:
+    # D3: long duration (>24h). Parent's D3 Confirm re-submits with
+    # force_confirmations=["D3"] to bypass and queue the actual shield.
+    if isinstance(duration, int) and duration > 24 * 60 and not skip_long_duration_guard:
         return DispatchResult(requires_card="D3")
 
     # D2: ambiguous "everything"
