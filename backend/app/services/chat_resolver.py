@@ -4,10 +4,18 @@ Input: target_request (the exact words the parent used) + optional hints from Ge
 Output: ResolverResult with tier + necessary fields for building a Command payload.
 
 Resolution priority:
-  1. Saved List name match (fuzzy)
-  2. App Catalog lookup (exact alias)
-  3. AI-inferred category
-  4. Total miss → confirmation_required
+  1. Saved List exact name match
+  2. Saved List fuzzy match when the parent likely meant a list
+  3. Explicit category request
+  4. App Catalog lookup (exact alias) -> confirmation, not category fallback
+  5. Total miss → confirmation_required
+
+Important product rule:
+  Chat defaults to Screen Time shield mode. A bundle ID lock hides the app icon,
+  so catalog hits are not used for default app locks. Also, an explicit app name
+  must not silently expand to a whole category. Exact app shield requires a
+  Saved List / FamilyActivityPicker token; otherwise the parent must confirm a
+  broader category lock or create a list first.
 """
 from __future__ import annotations
 
@@ -19,7 +27,7 @@ from backend.app.services.app_catalog import lookup as catalog_lookup
 
 @dataclass
 class ResolverResult:
-    tier: str | None = None  # "exact_bundle" | "saved_list" | "category" | None
+    tier: str | None = None  # "saved_list" | "category" | None
     bundle_id: str | None = None
     list_name: str | None = None
     category_hint: str | None = None
@@ -56,6 +64,15 @@ def _fuzzy_match_list(target: str, names: list[str], max_distance: int = 2) -> s
     return best[0] if best else None
 
 
+def _exact_match_list(target: str, names: list[str]) -> str | None:
+    """Case-insensitive exact saved-list match."""
+    t = target.strip().lower()
+    for name in names:
+        if name.lower() == t:
+            return name
+    return None
+
+
 def resolve(
     *,
     family_id: UUID | None,
@@ -81,36 +98,54 @@ def resolve(
     if not target:
         return ResolverResult(confirmation_required=True, suggestions=saved_list_names[:3])
 
-    # 1. Saved list (prefer list match when hint suggests list, but also try otherwise)
+    # 1. Exact saved-list match always wins. This lets a parent create a list
+    # named "微信" and later say "lock 微信" without the catalog hijacking it.
+    matched_list = _exact_match_list(target, saved_list_names)
+    if matched_list:
+        return ResolverResult(tier="saved_list", list_name=matched_list)
+
+    # 2. Fuzzy saved-list match only when the language likely means a list.
+    # Do not fuzzy-match arbitrary app names; that can create surprising locks.
     if target_kind_hint in ("list", None):
         matched_list = _fuzzy_match_list(target, saved_list_names)
         if matched_list:
             return ResolverResult(tier="saved_list", list_name=matched_list)
 
-    # 2. App catalog (exact alias match)
-    if target_kind_hint in ("app", None):
-        entry = catalog_lookup(target)
-        if entry is not None:
-            return ResolverResult(
-                tier="exact_bundle",
-                bundle_id=entry.bundle_id,
-                target_display=entry.names[0],
-                category_hint=entry.category_hint,
-            )
-
-    # 3. Direct category (Gemini said "category")
+    # 3. Direct category only when the parent explicitly asked for a category.
     if target_kind_hint == "category":
         hint = (category_hint_from_ai or target).lower()
         return ResolverResult(tier="category", category_hint=hint)
 
-    # 4. AI-inferred category fallback for unknown targets
+    # 4. App catalog (exact alias match)
+    #
+    # A catalog hit proves we understand the app name, but it still does not give
+    # us a FamilyActivityPicker token for shield.applications. Do not silently
+    # expand "lock 微信" to "lock all social apps"; require confirmation or a
+    # saved list first.
+    if target_kind_hint in ("app", None):
+        entry = catalog_lookup(target)
+        if entry is not None:
+            return ResolverResult(
+                target_display=entry.names[0],
+                category_hint=entry.category_hint,
+                confirmation_required=True,
+                suggestions=[
+                    f"create a saved list for {entry.names[0]}",
+                    f"lock the {entry.category_hint} category instead",
+                ],
+            )
+
+    # 5. AI-inferred category for unknown app names is only a suggestion. The
+    # parent has to confirm before we lock an entire category.
     if category_hint_from_ai:
         return ResolverResult(
-            tier="category",
+            target_display=target,
             category_hint=category_hint_from_ai.lower(),
+            confirmation_required=True,
+            suggestions=[f"lock the {category_hint_from_ai.lower()} category"],
         )
 
-    # 5. Total miss — ask for clarification
+    # 6. Total miss — ask for clarification
     return ResolverResult(
         confirmation_required=True,
         suggestions=saved_list_names[:3] if saved_list_names else ["games", "social", "entertainment"],

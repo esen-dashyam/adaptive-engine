@@ -1,7 +1,11 @@
-"""Static app catalog — alias → bundle ID lookup for Tier A (direct bundle block) locks.
+"""Static app catalog — alias → bundle ID + category hint lookup.
 
 Data ships in `app/data/app_catalog.json`. Matching is case-insensitive and
 exact (no fuzzy match at this layer — the Chat resolver may add fuzziness later).
+
+Bundle IDs are retained for future explicit hard-block behavior, but they are
+not the default UX because they hide app icons. The resolver treats catalog
+hits as recognition only; precise shield still requires a Saved List token.
 """
 from __future__ import annotations
 

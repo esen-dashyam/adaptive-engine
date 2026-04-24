@@ -13,15 +13,16 @@ def fid():
     return uuid4()
 
 
-# ----- Tier A: catalog hit -----
+# ----- Catalog hit -> confirmation, not category fallback -----
 
 def test_catalog_hit_IG(fid):
     r = resolve(
         family_id=fid, target_request="IG",
         target_kind_hint=None, saved_list_names=[],
     )
-    assert r.tier == "exact_bundle"
-    assert r.bundle_id == "com.burbn.instagram"
+    assert r.tier is None
+    assert r.bundle_id is None
+    assert r.confirmation_required is True
     assert r.target_display == "Instagram"
     assert r.category_hint == "social"
 
@@ -31,8 +32,10 @@ def test_catalog_hit_with_app_hint(fid):
         family_id=fid, target_request="TikTok",
         target_kind_hint="app", saved_list_names=[],
     )
-    assert r.tier == "exact_bundle"
-    assert r.bundle_id == "com.zhiliaoapp.musically"
+    assert r.tier is None
+    assert r.bundle_id is None
+    assert r.confirmation_required is True
+    assert r.category_hint == "social"
 
 
 def test_catalog_hit_chinese_alias(fid):
@@ -40,8 +43,11 @@ def test_catalog_hit_chinese_alias(fid):
         family_id=fid, target_request="抖音",
         target_kind_hint=None, saved_list_names=[],
     )
-    assert r.tier == "exact_bundle"
-    assert r.bundle_id == "com.zhiliaoapp.musically"
+    assert r.tier is None
+    assert r.bundle_id is None
+    assert r.confirmation_required is True
+    assert r.target_display == "TikTok"
+    assert r.category_hint == "social"
 
 
 # ----- Tier B: saved list -----
@@ -76,8 +82,19 @@ def test_saved_list_beats_catalog_when_hint_says_list(fid):
     assert r.list_name == "instagram"
 
 
+def test_saved_list_exact_beats_catalog_even_with_app_hint(fid):
+    # If a parent made a shield list named "微信", saying "lock 微信" must lock
+    # that precise saved list, not the broader Social category.
+    r = resolve(
+        family_id=fid, target_request="微信",
+        target_kind_hint="app", saved_list_names=["微信"],
+    )
+    assert r.tier == "saved_list"
+    assert r.list_name == "微信"
+
+
 def test_saved_list_fuzzy_too_far_misses(fid):
-    # Distance 3+ should NOT match — fallback to catalog/category
+    # Distance 3+ should NOT match — fallback to confirmation/catalog handling
     r = resolve(
         family_id=fid, target_request="bedroom apps",  # distance to "bedtime apps" = 3
         target_kind_hint=None, saved_list_names=["bedtime apps"],
@@ -103,7 +120,8 @@ def test_category_inferred_from_ai(fid):
         target_kind_hint=None, saved_list_names=[],
         category_hint_from_ai="games",
     )
-    assert r.tier == "category"
+    assert r.tier is None
+    assert r.confirmation_required is True
     assert r.category_hint == "games"
 
 
@@ -140,8 +158,8 @@ def test_empty_target_requires_confirmation(fid):
 # ----- Priority ordering -----
 
 def test_list_hint_does_not_pick_catalog(fid):
-    # hint=list but the target matches a catalog alias — should NOT return exact_bundle
-    # since the user's hint says it's a list
+    # hint=list but the target matches a catalog alias — should not treat it as
+    # an app lock since the user's hint says it's a list.
     r = resolve(
         family_id=fid, target_request="IG",
         target_kind_hint="list", saved_list_names=[],
@@ -151,11 +169,11 @@ def test_list_hint_does_not_pick_catalog(fid):
 
 
 def test_app_hint_skips_list_check(fid):
-    # hint=app + target matches a saved list exactly — hint wins, go to catalog
+    # Exact saved-list names always win. This avoids surprising category locks
+    # when a parent intentionally named a precise shield list after an app.
     r = resolve(
         family_id=fid, target_request="IG",
         target_kind_hint="app", saved_list_names=["IG"],  # unlikely but test it
     )
-    # With hint=app, skip step 1 (list), go straight to catalog which hits
-    assert r.tier == "exact_bundle"
-    assert r.bundle_id == "com.burbn.instagram"
+    assert r.tier == "saved_list"
+    assert r.list_name == "IG"

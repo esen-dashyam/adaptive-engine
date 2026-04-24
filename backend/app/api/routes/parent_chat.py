@@ -31,14 +31,14 @@ router = APIRouter(prefix="/parent", tags=["Parent Chat"])
 
 SYSTEM_PROMPT = """You are Evlin, an AI-powered parental control assistant. Your persona is "The Informed Sentinel" — authoritative, calm, data-driven.
 
-When the parent issues a lock/unlock command, emit a structured action. The backend will resolve it to the correct lock tier (exact app, saved list, or category fallback).
+When the parent issues a lock/unlock command, emit a structured action. The backend will resolve it to the correct shield tier.
 
 Response format (ALWAYS valid JSON):
 {
   "message": "Natural response to the parent (e.g., 'Locking Instagram on Liam's phone for 30 minutes.')",
   "reasoning": "Brief internal analysis",
   "action": null | {
-    "type": "lock" | "unlock" | "unlock_all",
+    "type": "lock" | "unlock" | "lock_all" | "unlock_all",
     "target_request": "<the exact words the parent used, e.g. 'IG' or 'list 1' or 'games'>",
     "target_kind_hint": "app" | "list" | "category" | null,
     "duration_minutes": 30 | null,
@@ -50,8 +50,12 @@ Response format (ALWAYS valid JSON):
 Rules:
 - If the request is a clean lock/unlock command, emit `action` with correct fields.
 - If ambiguous or missing info, set confirmation_required=true.
+- Use `type="lock_all"` only when the parent clearly wants the whole device locked: "lock all", "lock everything", "lock the whole phone", "ban all apps".
+- Use `type="unlock_all"` only when the parent clearly wants every active lock removed.
 - target_kind_hint: "list" if parent says "list 1"/"bedtime apps"/similar list names, "category" if "all games"/"social apps"/etc., "app" if a specific app name, null otherwise.
-- category_hint_from_ai: your best guess of which category the target belongs to (games/social/entertainment/productivity/education). Used as fallback when the app isn't in the catalog.
+- Only use target_kind_hint="category" when the parent explicitly asks for a whole category, such as "lock social apps" or "ban all games".
+- Do not classify a specific app name as category just because that app belongs to a category. For example, "lock WeChat" is target_kind_hint="app", not "category".
+- category_hint_from_ai: your best guess of which category the target belongs to (games/social/entertainment/productivity/education). This is only a suggestion for confirmation; it does not authorize automatic category locking for specific app names.
 - duration_minutes: integer minutes, or null for permanent/until-unlock.
 - Minimum lock duration on iOS is 15 minutes (Apple API limit). If parent asks for less, the system will silently clamp — just emit what they asked for.
 - Use clinical/strategic language, not casual.
@@ -68,7 +72,7 @@ class ChatRequest(BaseModel):
 class ChatAction(BaseModel):
     type: str
     command_id: UUID | None = None
-    tier: str | None = None            # exact_bundle | saved_list | category | None (for confirmation)
+    tier: str | None = None            # saved_list | category | None (for confirmation)
     target_display: str | None = None
     duration_minutes: int | None = None
     confirmation_required: bool = False
@@ -97,17 +101,18 @@ async def parent_chat(
     action_type = gemini_action.get("type", "lock")
 
     # Non-lock actions bypass the resolver
-    if action_type in ("unlock_all",):
+    if action_type in ("lock_all", "unlock_all"):
+        target_display = "all apps" if action_type == "lock_all" else "all locks"
         action_out = await _queue_simple_command(
             req=req, session=session, action_type=action_type,
-            target_display="all locks", payload_target={"original_request": "all"},
+            target_display=target_display, payload_target={"original_request": "all"},
         )
         return ChatResponse(
             message=message, reasoning=reasoning,
             action=ChatAction(
                 type=action_type,
                 command_id=action_out.command_id if action_out else None,
-                target_display="all locks",
+                target_display=target_display,
             ),
         )
 
@@ -126,12 +131,17 @@ async def parent_chat(
     )
 
     if resolved.confirmation_required:
+        confirmation_message = _confirmation_message(
+            action_type=action_type,
+            target_request=gemini_action.get("target_request", ""),
+            resolved=resolved,
+        )
         return ChatResponse(
-            message=message, reasoning=reasoning,
+            message=confirmation_message, reasoning=reasoning,
             action=ChatAction(
                 type=action_type,
                 confirmation_required=True,
-                target_display=gemini_action.get("target_request"),
+                target_display=resolved.target_display or gemini_action.get("target_request"),
             ),
         )
 
@@ -254,6 +264,28 @@ async def get_ack_status(
 
 # ----- Gemini wrapper + simple queue helper -----
 
+def _confirmation_message(
+    *,
+    action_type: str,
+    target_request: str,
+    resolved,
+) -> str:
+    """Human-safe confirmation copy when resolver refuses to broaden a lock."""
+    target = resolved.target_display or target_request or "that app"
+    category = resolved.category_hint
+    if action_type == "unlock":
+        return f"I need a more precise target before unlocking {target}."
+    if category:
+        return (
+            f"I know {target} is usually a {category} app, but I won't lock the entire "
+            f"{category} category unless you explicitly ask for that. Create or select a "
+            f"Saved List for {target}, or say \"lock {category} apps\" if you want the whole category blocked."
+        )
+    return (
+        f"I need a specific Saved List or category before locking {target}. "
+        "For a shield-style single-app lock, first add that app to a Saved List with the picker."
+    )
+
 async def _invoke_gemini(req: ChatRequest) -> tuple[dict | None, str, str | None]:
     """Returns (action_dict_or_None, message, reasoning)."""
     from google import genai
@@ -291,7 +323,7 @@ async def _queue_simple_command(
     *, req: ChatRequest, session: AsyncSession,
     action_type: str, target_display: str, payload_target: dict,
 ) -> _QueuedCommand | None:
-    """Queue non-lock commands (unlock_all). Returns None if no family paired."""
+    """Queue commands that do not need the resolver. Returns None if no family paired."""
     if req.family_id is None:
         return None
     child_stmt = select(Device).where(
