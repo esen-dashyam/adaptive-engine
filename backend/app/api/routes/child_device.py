@@ -65,7 +65,17 @@ async def ack_command(
     req: AckRequest,
     session: AsyncSession = Depends(get_async_session),
 ) -> dict:
-    """Child posts ack: confirmed_exact | confirmed_fallback | failed | timeout."""
+    """Child posts ack. See plan Phase 6 Task 6.4 for the full payload schema.
+
+    Acceptable `status` values:
+      - confirmed                  — v2 generic success; `detail` carries
+        {verb, display_name, [category, orig_request], [effective_state]}
+      - confirmed_exact            — v1 legacy, still accepted
+      - confirmed_fallback         — v1 legacy, still accepted
+      - pending_confirmation       — child needs parent to confirm; `detail`
+        carries {card_id, context}
+      - failed | timeout
+    """
     cmd = await session.get(Command, req.command_id)
     if cmd is None:
         raise HTTPException(404, "command not found")
@@ -75,6 +85,13 @@ async def ack_command(
         raise HTTPException(400, f"invalid status: {req.status}")
     cmd.acked_at = datetime.now(timezone.utc)
     cmd.ack_detail = req.detail
+
+    # v2 — extract structured fields so /parent/ack-status can surface them cleanly.
+    if req.detail:
+        cmd.ack_verb = req.detail.get("verb")
+        cmd.ack_effective_state = req.detail.get("effective_state")
+        cmd.ack_card_id = req.detail.get("card_id")
+        cmd.ack_context = req.detail.get("context")
 
     # Clean up any pending blob row — child has already consumed or failed
     blob_stmt = select(PendingBlob).where(PendingBlob.command_id == req.command_id)

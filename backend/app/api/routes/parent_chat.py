@@ -23,7 +23,7 @@ from backend.app.db.engine import get_async_session
 from backend.app.db.models.command import Command, AckStatus
 from backend.app.db.models.device import Device, DeviceMode
 from backend.app.db.models.saved_list import SavedListMeta
-from backend.app.services.chat_resolver import resolve
+from backend.app.services.chat_resolver import dispatch, DispatchResult
 
 
 router = APIRouter(prefix="/parent", tags=["Parent Chat"])
@@ -101,14 +101,26 @@ class ChatRequest(BaseModel):
     child_name: str = "Liam"
     history: list[dict[str, str]] = Field(default_factory=list)
 
+    # Card IDs the parent has already confirmed in-session. Dispatcher uses these
+    # to bypass the specific guard and dispatch the underlying action:
+    #   "A1" — Max first-time block → bypass A1, queue block Command
+    #   "B1" — permanent→timed shield downgrade → set force_downgrade=true
+    force_confirmations: list[str] = Field(default_factory=list)
+
 
 class ChatAction(BaseModel):
     type: str
     command_id: UUID | None = None
-    tier: str | None = None            # saved_list | category | None (for confirmation)
+    tier: str | None = None
     target_display: str | None = None
     duration_minutes: int | None = None
     confirmation_required: bool = False
+
+    # v2 fields
+    card_id: str | None = None                      # "A1", "B1", "D1", …
+    confirmation_reason: str | None = None
+    list_suggestions: list[str] = Field(default_factory=list)
+    category_guess: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -122,6 +134,7 @@ async def parent_chat(
     req: ChatRequest,
     session: AsyncSession = Depends(get_async_session),
 ) -> ChatResponse:
+    """Verb-first dispatcher wiring (plan Phase 6 Task 6.3)."""
     if not settings.gemini_api_key:
         raise HTTPException(503, "Gemini API key not configured")
 
@@ -131,115 +144,164 @@ async def parent_chat(
     if gemini_action is None:
         return ChatResponse(message=message, reasoning=reasoning, action=None)
 
-    action_type = _normalize_global_action_type(
-        message_text=req.message,
-        action_type=gemini_action.get("type", "lock"),
-        target_request=gemini_action.get("target_request", ""),
-    )
-
-    # Non-lock actions bypass the resolver
-    if action_type in ("lock_all", "unlock_all"):
-        target_display = "all apps" if action_type == "lock_all" else "all locks"
-        action_out = await _queue_simple_command(
-            req=req, session=session, action_type=action_type,
-            target_display=target_display, payload_target={"original_request": "all"},
-        )
-        return ChatResponse(
-            message=message, reasoning=reasoning,
-            action=ChatAction(
-                type=action_type,
-                command_id=action_out.command_id if action_out else None,
-                target_display=target_display,
-            ),
-        )
-
-    # Lock / Unlock — run resolver
+    # Fetch family state for dispatcher
     saved_list_names: list[str] = []
+    child_devices: list[Device] = []
+    protection_mode = "std"
     if req.family_id is not None:
-        stmt = select(SavedListMeta.name).where(SavedListMeta.family_id == req.family_id)
-        saved_list_names = [row[0] for row in (await session.execute(stmt)).all()]
+        list_stmt = select(SavedListMeta.name).where(SavedListMeta.family_id == req.family_id)
+        saved_list_names = [row[0] for row in (await session.execute(list_stmt)).all()]
 
-    resolved = resolve(
-        family_id=req.family_id,
-        target_request=gemini_action.get("target_request", ""),
-        target_kind_hint=gemini_action.get("target_kind_hint"),
+        child_stmt = select(Device).where(
+            Device.family_id == req.family_id, Device.mode == DeviceMode.child,
+        )
+        child_devices = list((await session.execute(child_stmt)).scalars().all())
+
+        # Protection mode lives on Family; fall back to std if missing.
+        try:
+            from backend.app.db.models.family import Family, ProtectionMode  # local import
+            family_row = await session.get(Family, req.family_id)
+            if family_row is not None:
+                pm = family_row.protection_mode
+                protection_mode = pm.value if hasattr(pm, "value") else str(pm)
+        except Exception:
+            protection_mode = "std"
+
+    result: DispatchResult = dispatch(
+        family_id=req.family_id or UUID(int=0),
+        protection_mode=protection_mode,
+        child_count=len(child_devices),
         saved_list_names=saved_list_names,
-        category_hint_from_ai=gemini_action.get("category_hint_from_ai"),
+        gemini_action=gemini_action,
+        force_confirmations=req.force_confirmations or [],
     )
 
-    if resolved.confirmation_required:
-        confirmation_message = _confirmation_message(
-            action_type=action_type,
-            target_request=gemini_action.get("target_request", ""),
-            resolved=resolved,
-        )
+    # Card-returning outcomes
+    if result.requires_card is not None:
+        action_type = gemini_action.get("type") or "shield"
         return ChatResponse(
-            message=confirmation_message, reasoning=reasoning,
+            message=message,
+            reasoning=reasoning,
             action=ChatAction(
                 type=action_type,
                 confirmation_required=True,
-                target_display=resolved.target_display or gemini_action.get("target_request"),
+                card_id=result.requires_card,
+                list_suggestions=result.list_suggestions,
+                category_guess=result.category_guess,
+                target_display=gemini_action.get("target_request"),
+                duration_minutes=gemini_action.get("duration_minutes") if isinstance(gemini_action.get("duration_minutes"), int) else None,
             ),
         )
 
-    # No family paired — return the parsed action for dev purposes but don't queue
+    # Gemini-flagged ambiguity (not a specific card)
+    if result.confirmation_required:
+        return ChatResponse(
+            message=message,
+            reasoning=reasoning,
+            action=ChatAction(
+                type=gemini_action.get("type") or "shield",
+                confirmation_required=True,
+                confirmation_reason=result.confirmation_reason,
+            ),
+        )
+
+    if result.receipt_only_text:
+        return ChatResponse(message=result.receipt_only_text, reasoning=None, action=None)
+
+    # Resolved — queue a Command
+    if result.resolved is None:
+        return ChatResponse(message=message, reasoning=reasoning, action=None)
+
     if req.family_id is None:
         logger.info("No family_id in chat request — returning parsed action without queueing")
         return ChatResponse(
             message=message, reasoning=reasoning,
             action=ChatAction(
-                type=action_type,
-                tier=resolved.tier,
-                target_display=resolved.target_display or resolved.list_name or resolved.category_hint,
-                duration_minutes=gemini_action.get("duration_minutes"),
+                type=result.resolved.action,
+                tier=result.resolved.tier,
+                target_display=result.resolved.target_display,
+                duration_minutes=result.resolved.duration_minutes,
             ),
         )
 
-    # Look up the child device for this family
-    child_stmt = select(Device).where(
-        Device.family_id == req.family_id,
-        Device.mode == DeviceMode.child,
-    )
-    child = (await session.execute(child_stmt)).scalar_one_or_none()
-    if child is None:
+    if not child_devices:
         raise HTTPException(400, "no child device paired to this family")
 
+    # Pick the child device that matches child_name_hint.
+    hint = result.resolved.child_name_hint
+    target_child: Device | None = None
+    if hint:
+        needle = hint.strip().lower()
+        matches = [
+            dev for dev in child_devices
+            if needle == (dev.label or "").strip().lower()
+            or needle in (dev.label or "").strip().lower()
+        ]
+        if len(matches) == 1:
+            target_child = matches[0]
+        if target_child is None:
+            # Hint didn't resolve — re-prompt with D4.
+            return ChatResponse(
+                message=message,
+                reasoning=reasoning,
+                action=ChatAction(
+                    type=result.resolved.action,
+                    confirmation_required=True,
+                    card_id="D4",
+                    target_display=result.resolved.target_display,
+                ),
+            )
+    else:
+        if len(child_devices) > 1:
+            return ChatResponse(
+                message=message, reasoning=reasoning,
+                action=ChatAction(
+                    type=result.resolved.action, confirmation_required=True, card_id="D4",
+                    target_display=result.resolved.target_display,
+                ),
+            )
+        target_child = child_devices[0]
+
     payload_target: dict[str, Any] = {
-        "bundle_id": resolved.bundle_id,
-        "list_name": resolved.list_name,
-        "has_pending_blob": False,    # Max mode: set True via /parent/commands/attach-blob
-        "category_hint": resolved.category_hint,
+        "bundle_id": result.resolved.bundle_id,
+        "list_name": result.resolved.list_name,
+        "list_id": result.resolved.list_id,
+        "category_hint": result.resolved.category_hint,
+        "target_all": result.resolved.target_all,
+        "target_child_id": str(target_child.id),
+        "target_display": result.resolved.target_display,
         "original_request": gemini_action.get("target_request", ""),
-        "target_display": resolved.target_display,
+        "has_pending_blob": False,
+        "force_downgrade": result.resolved.force_downgrade,
     }
 
     payload = {
-        "action": action_type,
-        "tier": resolved.tier,
+        "action": result.resolved.action,
+        "tier": result.resolved.tier,
         "target": payload_target,
-        "duration_minutes": gemini_action.get("duration_minutes"),
+        "duration_minutes": result.resolved.duration_minutes,
         "issued_at": datetime.now(timezone.utc).isoformat(),
     }
 
     cmd = Command(
         family_id=req.family_id,
-        target_device_id=child.id,
+        target_device_id=target_child.id,
         payload=payload,
         ack_status=AckStatus.pending,
     )
     session.add(cmd)
     await session.flush()
-    logger.info("Queued {} command {} for child {}", action_type, cmd.id, child.id)
+    logger.info("Queued {} command {} for child {}", result.resolved.action, cmd.id, target_child.id)
 
     return ChatResponse(
         message=message,
         reasoning=reasoning,
         action=ChatAction(
-            type=action_type,
+            type=result.resolved.action,
             command_id=cmd.id,
-            tier=resolved.tier,
-            target_display=resolved.target_display or resolved.list_name or resolved.category_hint,
-            duration_minutes=gemini_action.get("duration_minutes"),
+            tier=result.resolved.tier,
+            target_display=result.resolved.target_display,
+            duration_minutes=result.resolved.duration_minutes,
         ),
     )
 
@@ -282,10 +344,23 @@ async def attach_blob(
 
 # ----- /parent/ack-status -----
 
+class AckPendingConfirmation(BaseModel):
+    card_id: str
+    context: dict
+
+
 class AckStatusResponse(BaseModel):
     command_id: UUID
     status: str
-    detail: dict | None
+    detail: dict | None = None
+
+    # v2 structured fields (plan Phase 6 Task 6.4). Present when status=="confirmed".
+    verb: str | None = None
+    displayName: str | None = None
+    category: str | None = None
+    origRequest: str | None = None
+    effectiveState: dict | None = None
+    pendingConfirmation: AckPendingConfirmation | None = None
 
 
 @router.get("/ack-status", response_model=AckStatusResponse, summary="Parent polls for child's ack")
@@ -296,7 +371,24 @@ async def get_ack_status(
     cmd = await session.get(Command, command_id)
     if not cmd:
         raise HTTPException(404, "command not found")
-    return AckStatusResponse(command_id=cmd.id, status=cmd.ack_status.value, detail=cmd.ack_detail)
+
+    # Build v2 payload when the child posted a rich ack.
+    pending = None
+    if cmd.ack_card_id is not None:
+        pending = AckPendingConfirmation(card_id=cmd.ack_card_id, context=cmd.ack_context or {})
+
+    detail = cmd.ack_detail or {}
+    return AckStatusResponse(
+        command_id=cmd.id,
+        status=cmd.ack_status.value,
+        detail=cmd.ack_detail,
+        verb=cmd.ack_verb,
+        displayName=detail.get("display_name") if isinstance(detail, dict) else None,
+        category=detail.get("category") if isinstance(detail, dict) else None,
+        origRequest=detail.get("orig_request") if isinstance(detail, dict) else None,
+        effectiveState=cmd.ack_effective_state,
+        pendingConfirmation=pending,
+    )
 
 
 # ----- Gemini wrapper + simple queue helper -----
