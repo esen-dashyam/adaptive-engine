@@ -297,20 +297,32 @@ async def parent_chat(
     if not child_devices:
         raise HTTPException(400, "no child device paired to this family")
 
-    # Pick the child device that matches child_name_hint.
-    hint = result.resolved.child_name_hint
+    # Pick the child device.
+    #
+    # Single-child families: always use that child. `child_name_hint` is advisory
+    # in this case — Gemini may fill it from the ChatRequest.child_name context
+    # even when the parent didn't say the name, and the device label often
+    # doesn't match ("Fred's iPhone" vs hint "Liam"). Falling back to D4 there
+    # would be a false positive. D4 only makes sense for multi-child families.
+    #
+    # Multi-child families: require a hint, strict-ish match against Device.label
+    # (equality or substring, case-insensitive). 0 or >1 matches → D4 re-prompt.
     target_child: Device | None = None
-    if hint:
-        needle = hint.strip().lower()
-        matches = [
-            dev for dev in child_devices
-            if needle == (dev.label or "").strip().lower()
-            or needle in (dev.label or "").strip().lower()
-        ]
-        if len(matches) == 1:
-            target_child = matches[0]
+    if len(child_devices) == 1:
+        target_child = child_devices[0]
+    else:
+        hint = result.resolved.child_name_hint
+        if hint:
+            needle = hint.strip().lower()
+            matches = [
+                dev for dev in child_devices
+                if needle == (dev.label or "").strip().lower()
+                or needle in (dev.label or "").strip().lower()
+            ]
+            if len(matches) == 1:
+                target_child = matches[0]
         if target_child is None:
-            # Hint didn't resolve — re-prompt with D4.
+            # Multi-child + (no hint OR hint ambiguous) → ask the parent.
             return ChatResponse(
                 message=message,
                 reasoning=reasoning,
@@ -321,16 +333,6 @@ async def parent_chat(
                     target_display=result.resolved.target_display,
                 ),
             )
-    else:
-        if len(child_devices) > 1:
-            return ChatResponse(
-                message=message, reasoning=reasoning,
-                action=ChatAction(
-                    type=result.resolved.action, confirmation_required=True, card_id="D4",
-                    target_display=result.resolved.target_display,
-                ),
-            )
-        target_child = child_devices[0]
 
     payload_target: dict[str, Any] = {
         "bundle_id": result.resolved.bundle_id,
