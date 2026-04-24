@@ -191,6 +191,7 @@ class PairingStatusResponse(BaseModel):
     code: str
     used: bool
     parent_device_id: uuid.UUID | None
+    protection_mode: ProtectionMode
 
 
 @router.get("/pairing-status", response_model=PairingStatusResponse, summary="Child polls for parent join")
@@ -209,7 +210,12 @@ async def pairing_status(code: str, session: AsyncSession = Depends(get_async_se
         if parent:
             parent_id = parent.id
 
-    return PairingStatusResponse(code=code, used=pairing.used, parent_device_id=parent_id)
+    return PairingStatusResponse(
+        code=code,
+        used=pairing.used,
+        parent_device_id=parent_id,
+        protection_mode=pairing.protection_mode,
+    )
 
 
 # ---------- /family/auth-status ----------
