@@ -23,7 +23,73 @@ from backend.app.db.engine import get_async_session
 from backend.app.db.models.command import Command, AckStatus
 from backend.app.db.models.device import Device, DeviceMode
 from backend.app.db.models.saved_list import SavedListMeta
+from backend.app.services.app_catalog import lookup as catalog_lookup
 from backend.app.services.chat_resolver import dispatch, DispatchResult
+
+
+def _canonical_display(target_request: str | None) -> str | None:
+    """Promote catalog-known aliases to the canonical display name.
+
+    Fixes cards that show the user's raw phrasing ("ig", "tiktok") instead of
+    the pretty name ("Instagram", "TikTok"). No-op for anything not in the catalog.
+    """
+    if not target_request:
+        return target_request
+    entry = catalog_lookup(target_request)
+    return entry.names[0] if entry else target_request
+
+
+def _card_transition_message(card_id: str, target: str | None, duration_minutes: int | None) -> str:
+    """Neutral over-the-card copy. Replaces Gemini's natural-language reply
+    when the dispatcher routes to a confirmation card — Gemini doesn't know a
+    card will fire, so its "I'll do X" reply would contradict the card.
+    See plan Phase 6/9 UX discussion.
+    """
+    t = target or "that"
+    d = f"{duration_minutes} min" if duration_minutes else None
+
+    match card_id:
+        # Group A — destructive confirmations
+        case "A1":
+            return f"Just to confirm — block {t}? This hides it from the home screen until you unblock."
+        case "A3":
+            return "Unblock everything? Here's what's currently blocked:"
+        # Group B — downgrade
+        case "B1":
+            return f"{t} is currently shielded permanently. Do you want to change it to " + (d or "a timed shield") + "?"
+        case "B2":
+            return f"{t} is currently blocked. Switch to a timed shield instead?"
+        # Group C — upgrade
+        case "C1":
+            return f"Replace the shield on {t} with a permanent block?"
+        case "C2":
+            return f"{t} is in a shielded list. Block just this app?"
+        # Group D — missing info / ambiguity
+        case "D1":
+            return f"Before I shield {t} — how long?"
+        case "D2":
+            return "\"everything\" could mean a few different things. Which one?"
+        case "D3":
+            return f"That's a long lock ({d or 'over a day'}). Are you sure?"
+        case "D4":
+            return f"Which child's phone should this apply to?"
+        # Group E — rejection + alternative
+        case "E1":
+            return f"Hmm, I can't shield {t} directly in Standard mode. Here are some alternatives:"
+        case "E2":
+            return f"Blocking is a Maximum-mode feature. Want to shield {t} temporarily instead?"
+        case "E3":
+            return f"I don't recognize {t} in my catalog, so I can't hard-block it. But I can try something else:"
+        case "E4":
+            return f"I don't see a Saved List called \"{t}\". Want to create it?"
+        # Group F — fuzzy list match
+        case "F1":
+            return f"I couldn't find \"{t}\" exactly. Did you mean one of these?"
+        # Group G — onboarding
+        case "G1":
+            return "Maximum mode needs a Child Apple ID on this phone."
+        case _:
+            return f"I need to confirm something before I do that."
 
 
 router = APIRouter(prefix="/parent", tags=["Parent Chat"])
@@ -176,11 +242,15 @@ async def parent_chat(
         force_confirmations=req.force_confirmations or [],
     )
 
-    # Card-returning outcomes
+    # Card-returning outcomes — override Gemini's "I'll do X" message with a
+    # neutral over-the-card transition. See _card_transition_message.
     if result.requires_card is not None:
         action_type = gemini_action.get("type") or "shield"
+        display = _canonical_display(gemini_action.get("target_request"))
+        duration = gemini_action.get("duration_minutes") if isinstance(gemini_action.get("duration_minutes"), int) else None
+        transition = _card_transition_message(result.requires_card, display, duration)
         return ChatResponse(
-            message=message,
+            message=transition,
             reasoning=reasoning,
             action=ChatAction(
                 type=action_type,
@@ -188,8 +258,8 @@ async def parent_chat(
                 card_id=result.requires_card,
                 list_suggestions=result.list_suggestions,
                 category_guess=result.category_guess,
-                target_display=gemini_action.get("target_request"),
-                duration_minutes=gemini_action.get("duration_minutes") if isinstance(gemini_action.get("duration_minutes"), int) else None,
+                target_display=display,
+                duration_minutes=duration,
             ),
         )
 
