@@ -98,7 +98,11 @@ async def parent_chat(
     if gemini_action is None:
         return ChatResponse(message=message, reasoning=reasoning, action=None)
 
-    action_type = gemini_action.get("type", "lock")
+    action_type = _normalize_global_action_type(
+        message_text=req.message,
+        action_type=gemini_action.get("type", "lock"),
+        target_request=gemini_action.get("target_request", ""),
+    )
 
     # Non-lock actions bypass the resolver
     if action_type in ("lock_all", "unlock_all"):
@@ -263,6 +267,36 @@ async def get_ack_status(
 
 
 # ----- Gemini wrapper + simple queue helper -----
+
+def _normalize_global_action_type(*, message_text: str, action_type: str, target_request: str) -> str:
+    """Coerce obvious whole-device intents even if Gemini emits plain lock/unlock."""
+    combined = f"{message_text} {target_request}".lower()
+    global_markers = (
+        "lock all",
+        "lock everything",
+        "lock the whole phone",
+        "lock whole phone",
+        "ban all apps",
+        "all apps",
+        "everything",
+        "整个手机",
+        "所有 app",
+        "全部 app",
+        "全锁",
+    )
+    unlock_markers = (
+        "unlock all",
+        "unlock everything",
+        "clear all locks",
+        "all locks",
+        "全部解锁",
+        "全部解除",
+    )
+    if action_type == "lock" and any(marker in combined for marker in global_markers):
+        return "lock_all"
+    if action_type == "unlock" and any(marker in combined for marker in unlock_markers):
+        return "unlock_all"
+    return action_type
 
 def _confirmation_message(
     *,
