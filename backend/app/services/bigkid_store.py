@@ -97,6 +97,23 @@ class BigKidStore:
         self._reflection_correct[(child_id, rid)] = correct
         return req
 
+    def trigger_reflection_with_content(
+        self, child_id: UUID, *, reason: str,
+        video_id: str, video_title: str, writing_prompt: str,
+        quiz_public: list[QuizQuestionPublic], correct_indices: list[int],
+    ) -> ReflectionRequest:
+        s = self._ensure_seeded(child_id)
+        rid = uuid4()
+        req = ReflectionRequest(
+            id=rid, reason=reason,
+            video_id=video_id, video_title=video_title,
+            writing_prompt=writing_prompt, quiz=quiz_public,
+            status=ReflectionStatus.pending,
+        )
+        s.reflection = req
+        self._reflection_correct[(child_id, rid)] = correct_indices
+        return req
+
     def complete_reflection_step(
         self, child_id: UUID, rid: UUID, step: ReflectionStep
     ) -> ReflectionRequest:

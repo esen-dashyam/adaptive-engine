@@ -4,6 +4,7 @@ uses fixture content so the v1 child flow is testable end-to-end.
 """
 from __future__ import annotations
 
+import os
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,19 +12,32 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.app.schemas.bigkid import (
     ParentBypassRespondBody, ParentReflectionApproveBody,
     ParentReflectionTriggerBody, ParentTaskReviewBody,
-    ReflectionRequest, Task,
+    QuizQuestionPublic, ReflectionRequest, Task,
 )
 from backend.app.services.bigkid_store import BigKidStore, get_store
+from backend.app.services.gemini_reflection import generate_reflection_content
 
 
 router = APIRouter(tags=["Big-Kid Parent"])
 
 
 @router.post("/parent/reflection/trigger", response_model=ReflectionRequest)
-def trigger_reflection(
+async def trigger_reflection(
     body: ParentReflectionTriggerBody,
     store: BigKidStore = Depends(get_store),
 ) -> ReflectionRequest:
+    if os.environ.get("BIGKID_USE_GEMINI", "0") == "1":
+        try:
+            content = await generate_reflection_content(reason=body.reason)
+            return store.trigger_reflection_with_content(
+                body.child_id, reason=body.reason,
+                video_id=content.video_id, video_title=content.video_title,
+                writing_prompt=content.writing_prompt,
+                quiz_public=[QuizQuestionPublic(q=q.q, options=q.options) for q in content.quiz],
+                correct_indices=[q.correct_index for q in content.quiz],
+            )
+        except Exception:
+            pass  # fall through to fixture
     return store.trigger_reflection(body.child_id, body.reason)
 
 
