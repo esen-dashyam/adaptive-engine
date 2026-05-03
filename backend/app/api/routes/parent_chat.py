@@ -91,6 +91,9 @@ def _card_transition_message(card_id: str, target: str | None, duration_minutes:
         # Group G — onboarding
         case "G1":
             return "Maximum mode needs a Child Apple ID on this phone."
+        # Group R — reflection confirmation (big-kid mode)
+        case "R1":
+            return f"Want me to send a reflection about that?"
         case _:
             return f"I need to confirm something before I do that."
 
@@ -110,15 +113,32 @@ unblock / restore / bring back                       →  "unblock"
 "unlock everything" / "unlock all" / "clear locks"   →  "unshield_all"
 "unblock everything" / "unblock all"                 →  "unblock_all"
 
-REFLECTION (big-kid mode):
-"trigger reflection" / "make him reflect" / "give him a reflection" /
-"reflect for X" / "kid did Y, send reflection" / "lock him in reflection"
-                                                     →  "reflect"
+REFLECTION (big-kid mode) — emit type:"reflect" in TWO situations:
+
+1. EXPLICIT request: "trigger reflection", "make him reflect",
+   "give her a reflection", "send X a reflection" → reflect
+
+2. NARRATION OF MISBEHAVIOR: parent describes a child doing something
+   wrong (rude language, breaking a rule, hitting a sibling, ignoring a
+   chore, lying, screen overuse, tantrum, etc.) WITHOUT explicitly asking
+   for a reflection. Examples:
+   - "He called me a bitch at dinner"
+   - "She hit her sister again"
+   - "Liam wouldn't stop scrolling past bedtime"
+   - "He lied about his homework"
+   → reflect (the host app will surface a confirmation card before firing)
+
+   DO NOT trigger reflect for:
+   - Neutral observations ("He had a long day")
+   - Positive narration ("She finished her chores!")
+   - Questions ("What should I do about screen time?")
+   - Vague venting that names no specific bad behavior
 
 When type=="reflect", emit:
 {
   "type": "reflect",
-  "reflection_reason": "<the parent's description of what the child did wrong, in plain English; if the parent didn't give one, leave null and the dispatcher will ask>"
+  "reflection_reason": "<plain-English description of WHAT the child did wrong (kid-action only, not parent feelings). Avoid 'You did' literal phrasing — the downstream model will rephrase it.>",
+  "message": "<empathetic acknowledgement of the parent's frustration in 1–2 sentences. NEVER say 'I'll send a reflection' — the host app handles confirmation.>"
 }
 Other shield/block fields (target_request, duration_minutes, etc.) are NOT used for reflect.
 
@@ -233,9 +253,16 @@ async def parent_chat(
 
     # Big-kid reflection trigger — intercept BEFORE the shield/block dispatcher.
     # Bypasses the entire family/device/Command pipeline because BigKid lives in
-    # its own in-memory store keyed by child_device_id. Returns plain text.
+    # its own in-memory store keyed by child_device_id.
+    #
+    # Confirmation gate (R1 card): the first time the parent describes a
+    # misbehavior, we don't fire the reflection — we surface an empathetic
+    # message and a confirmation card. Only when the parent re-sends with
+    # `force_confirmations=["R1"]` do we actually call Gemini to generate
+    # quiz content and write to the BigKidStore.
     if gemini_action.get("type") == "reflect":
         reason = (gemini_action.get("reflection_reason") or "").strip()
+        force = req.force_confirmations or []
         if not reason:
             return ChatResponse(
                 message="Got it — what did they do? Tell me in one sentence and I'll send the reflection.",
@@ -243,9 +270,24 @@ async def parent_chat(
             )
         if req.child_device_id is None:
             return ChatResponse(
-                message="I can't trigger a reflection — no child device is paired to this app yet. Open the BigKid debug panel and set the child id, or pair the kid's phone first.",
+                message="I can't send a reflection — no child device is paired to this app yet. Pair the kid's phone first.",
                 reasoning=reasoning, action=None,
             )
+        if "R1" not in force:
+            # Surface the empathetic Gemini message (already contains the
+            # acknowledgement of the parent's frustration) and attach the
+            # R1 card. The card body is built on iOS from `target_display`.
+            return ChatResponse(
+                message=message,
+                reasoning=reasoning,
+                action=ChatAction(
+                    type="reflect",
+                    target_display=reason,
+                    confirmation_required=True,
+                    card_id="R1",
+                ),
+            )
+        # Confirmed — generate content + write to BigKid store.
         try:
             content = await generate_reflection_content(reason=reason)
         except Exception as exc:
@@ -264,7 +306,7 @@ async def parent_chat(
             correct_indices=[q.correct_index for q in content.quiz],
         )
         confirm = (
-            f"Done — reflection queued for the kid's phone.\n\n"
+            f"Done — reflection sent to {req.child_name}'s phone.\n\n"
             f"They'll see: “{content.display_reason}”\n\n"
             f"Three steps (video → quiz → writing) will unlock their device when finished."
         )
