@@ -253,11 +253,16 @@ class ChatResponse(BaseModel):
     cancelled_proposals: list[str] = Field(default_factory=list)
 
 
-def _trimmed_snapshot(state) -> dict:
+def _trimmed_snapshot(state, *, child_id: UUID) -> dict:
     """Strip context-bloat from the full ChildStateResponse for the
     agent's auto-injected state. See spec §4.4. Drops quiz body, photo
-    URLs, and any large per-task fields."""
+    URLs, and any large per-task fields.
+
+    `child_id` is included so the agent can pass it to tools that
+    require it (e.g. get_kid_state, approve_task) without the parent
+    having to type out a UUID."""
     return {
+        "child_id": str(child_id),
         "child_name": state.child_name,
         "minutes_left": state.minutes_left,
         "minutes_max": state.minutes_max,
@@ -311,7 +316,7 @@ async def parent_chat(
         state_snapshot: dict | None = None
         if req.child_device_id is not None:
             full = get_bigkid_store().get_state(req.child_device_id)
-            state_snapshot = _trimmed_snapshot(full)
+            state_snapshot = _trimmed_snapshot(full, child_id=req.child_device_id)
 
         loop = AgentLoop(
             registry=GLOBAL_REGISTRY,
