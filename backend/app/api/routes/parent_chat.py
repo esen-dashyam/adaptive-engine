@@ -261,6 +261,22 @@ def _trimmed_snapshot(state, *, child_id: UUID) -> dict:
     `child_id` is included so the agent can pass it to tools that
     require it (e.g. get_kid_state, approve_task) without the parent
     having to type out a UUID."""
+    def _human_status(t) -> str:
+        # Collapse the (status, phase) pair into a single label the AI
+        # cannot misread. Backend's TaskPhase enum has no `done` value,
+        # so an approved task surfaces as status=done + phase=submitted —
+        # the AI saw `phase=submitted` and replied "awaiting your review"
+        # for already-approved tasks. Fix: tell the AI exactly one thing.
+        if t.status.value == "done":
+            return "approved_done"
+        if t.status.value == "submitted":
+            return "submitted_awaiting_parent_review"
+        if t.status.value == "overdue":
+            return "overdue_not_submitted"
+        if t.phase.value == "redo":
+            return "needs_redo_after_parent_feedback"
+        return "not_started"
+
     return {
         "child_id": str(child_id),
         "child_name": state.child_name,
@@ -270,8 +286,7 @@ def _trimmed_snapshot(state, *, child_id: UUID) -> dict:
             {
                 "id": str(t.id),
                 "title": t.title,
-                "status": t.status.value,
-                "phase": t.phase.value,
+                "status_label": _human_status(t),
                 "has_photo": bool(t.evidence_photo_url),
                 "has_note": bool(t.evidence_note),
                 "has_bypass": t.bypass is not None,
