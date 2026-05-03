@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from backend.app.core.settings import settings
 from pydantic import BaseModel
@@ -146,17 +146,22 @@ def create_task(
 
 
 # ---------- parent deletes a task ----------
+# NOTE: status_code is set at runtime (Response return) rather than on the
+# decorator. FastAPI 0.111.x asserts at register time that 204 endpoints
+# cannot declare a response body — passing status_code=204 in the decorator
+# trips that assertion and crashes the whole app at boot. Returning a
+# Response object dodges the check while still emitting the right status.
 
-@router.delete("/parent/task/{task_id}", status_code=204)
+@router.delete("/parent/task/{task_id}", response_model=None)
 def delete_task(
     task_id: UUID,
     store: BigKidStore = Depends(get_store),
-) -> None:
+) -> Response:
     for cid, s in store._states.items():  # noqa: SLF001
         for t in s.tasks:
             if t.id == task_id:
                 store.delete_task(cid, task_id)
-                return
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
     raise HTTPException(status_code=404, detail="task not found")
 
 
