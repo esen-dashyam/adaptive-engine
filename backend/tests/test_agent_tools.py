@@ -73,3 +73,51 @@ async def test_list_pending_submissions_filters_status() -> None:
     # No submissions yet.
     result = await GLOBAL_REGISTRY.call("list_pending_submissions", {"child_id": cid})
     assert result.public["submissions"] == []
+
+
+@_pytest.mark.asyncio
+async def test_review_submissions_with_no_pending_returns_empty(monkeypatch) -> None:
+    from backend.app.services import bigkid_store
+    bigkid_store._singleton = None
+    from backend.app.services.agent_tools import GLOBAL_REGISTRY
+    from backend.app.services.agent_tools import vision_tools  # noqa: F401
+
+    cid = "33333333-3333-3333-3333-333333333333"
+    result = await GLOBAL_REGISTRY.call("review_submissions", {"child_id": cid})
+    assert result.public["verdicts"] == []
+
+
+@_pytest.mark.asyncio
+async def test_review_submissions_calls_multimodal_for_each(monkeypatch) -> None:
+    from backend.app.services import bigkid_store
+    bigkid_store._singleton = None
+    store = bigkid_store.get_store()
+
+    cid_str = "44444444-4444-4444-4444-444444444444"
+    cid_uuid = UUID(cid_str)
+    state = store.get_state(cid_uuid)
+    task_id = state.tasks[0].id
+
+    # Mark a task as submitted with a fake photo URL (we won't fetch it).
+    store.submit_evidence(
+        cid_uuid, task_id, photo_url="https://example.com/x.jpg",
+        photo_bytes=None, note="all done",
+    )
+
+    # Stub the multimodal call.
+    async def fake_mm(prompt, items):
+        return [{"task_id": str(it["task_id"]), "looks_done": True,
+                 "confidence": 0.9, "note": "looks fine",
+                 "recommend_action": "approve"} for it in items]
+    async def fake_fetch(url):
+        return b"fakejpg"
+
+    from backend.app.services.agent_tools import vision_tools
+    monkeypatch.setattr(vision_tools, "_call_multimodal", fake_mm)
+    monkeypatch.setattr(vision_tools, "_fetch_photo_bytes", fake_fetch)
+
+    from backend.app.services.agent_tools import GLOBAL_REGISTRY
+    result = await GLOBAL_REGISTRY.call("review_submissions", {"child_id": cid_str})
+    verdicts = result.public["verdicts"]
+    assert len(verdicts) == 1
+    assert verdicts[0]["recommend_action"] == "approve"
