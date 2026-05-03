@@ -48,6 +48,26 @@ class BigKidStore:
             task.bypass.responded_at = datetime.now(timezone.utc)
         return task
 
+    # ---------- parent task creation ----------
+
+    def create_task(
+        self, child_id: UUID, *, title: str, description: str,
+        category: TaskCategory, due: str | None,
+    ) -> Task:
+        s = self._ensure_seeded(child_id)
+        task = Task(
+            id=uuid4(), title=title, description=description,
+            category=category, due=due,
+            status=TaskStatus.todo, phase=TaskPhase.input,
+        )
+        s.tasks.append(task)
+        return task
+
+    def delete_task(self, child_id: UUID, task_id: UUID) -> None:
+        s = self._ensure_seeded(child_id)
+        s.tasks = [t for t in s.tasks if t.id != task_id]
+        s.recompute_time_pool()
+
     # ---------- bypass ----------
 
     def create_bypass(self, child_id: UUID, task_id: UUID, reason: str) -> BypassRequest:
@@ -59,6 +79,27 @@ class BigKidStore:
         )
         task.bypass = bypass
         return bypass
+
+    def respond_bypass(
+        self, bypass_id: UUID, *, decision: str, message: str | None,
+    ) -> BypassRequest:
+        # Scan all child states — bypass IDs are globally unique.
+        for s in self._states.values():
+            for t in s.tasks:
+                if t.bypass and t.bypass.id == bypass_id:
+                    if decision == "approve":
+                        t.bypass.status = BypassStatus.approved
+                        t.status = TaskStatus.done
+                        t.phase = TaskPhase.submitted
+                        s.recompute_time_pool()
+                    elif decision == "deny":
+                        t.bypass.status = BypassStatus.denied
+                    else:
+                        raise ValueError(f"unknown decision: {decision}")
+                    t.bypass.parent_response = message
+                    t.bypass.responded_at = datetime.now(timezone.utc)
+                    return t.bypass
+        raise ValueError(f"bypass {bypass_id} not found")
 
     # ---------- parent task review ----------
 

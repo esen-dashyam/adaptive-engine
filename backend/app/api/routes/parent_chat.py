@@ -24,7 +24,10 @@ from backend.app.db.models.command import Command, AckStatus
 from backend.app.db.models.device import Device, DeviceMode
 from backend.app.db.models.saved_list import SavedListMeta
 from backend.app.services.app_catalog import lookup as catalog_lookup
+from backend.app.services.bigkid_store import get_store as get_bigkid_store
 from backend.app.services.chat_resolver import dispatch, DispatchResult
+from backend.app.services.gemini_reflection import generate_reflection_content
+from backend.app.schemas.bigkid import QuizQuestionPublic
 
 
 def _canonical_display(target_request: str | None) -> str | None:
@@ -107,6 +110,18 @@ unblock / restore / bring back                       →  "unblock"
 "unlock everything" / "unlock all" / "clear locks"   →  "unshield_all"
 "unblock everything" / "unblock all"                 →  "unblock_all"
 
+REFLECTION (big-kid mode):
+"trigger reflection" / "make him reflect" / "give him a reflection" /
+"reflect for X" / "kid did Y, send reflection" / "lock him in reflection"
+                                                     →  "reflect"
+
+When type=="reflect", emit:
+{
+  "type": "reflect",
+  "reflection_reason": "<the parent's description of what the child did wrong, in plain English; if the parent didn't give one, leave null and the dispatcher will ask>"
+}
+Other shield/block fields (target_request, duration_minutes, etc.) are NOT used for reflect.
+
 AMBIGUOUS VERBS — must trigger confirmation_required:
 remove / kill / delete / stop / close / end / get rid of
 
@@ -146,7 +161,8 @@ RESPONSE FORMAT (always valid JSON):
   "message": "conversational reply to the parent",
   "reasoning": "brief internal analysis",
   "action": {
-    "type": "shield" | "block" | "unshield" | "unblock" | "unshield_all" | "unblock_all" | null,
+    "type": "shield" | "block" | "unshield" | "unblock" | "unshield_all" | "unblock_all" | "reflect" | null,
+    "reflection_reason": "<plain-English reason>" | null,
     "target_request": "<parent's original target phrase>",
     "target_kind_hint": "app" | "list" | "category" | "all" | null,
     "duration_minutes": <int> | null | "missing",
@@ -172,6 +188,11 @@ class ChatRequest(BaseModel):
     #   "A1" — Max first-time block → bypass A1, queue block Command
     #   "B1" — permanent→timed shield downgrade → set force_downgrade=true
     force_confirmations: list[str] = Field(default_factory=list)
+
+    # Big-kid child id (UUID string). Required for `reflect` action;
+    # ignored for everything else. iOS reads this from the same
+    # @AppStorage("evlin.childDeviceID") that the BigKid debug panel uses.
+    child_device_id: UUID | None = None
 
 
 class ChatAction(BaseModel):
@@ -209,6 +230,45 @@ async def parent_chat(
     # No action from Gemini — just a conversational reply
     if gemini_action is None:
         return ChatResponse(message=message, reasoning=reasoning, action=None)
+
+    # Big-kid reflection trigger — intercept BEFORE the shield/block dispatcher.
+    # Bypasses the entire family/device/Command pipeline because BigKid lives in
+    # its own in-memory store keyed by child_device_id. Returns plain text.
+    if gemini_action.get("type") == "reflect":
+        reason = (gemini_action.get("reflection_reason") or "").strip()
+        if not reason:
+            return ChatResponse(
+                message="Got it — what did they do? Tell me in one sentence and I'll send the reflection.",
+                reasoning=reasoning, action=None,
+            )
+        if req.child_device_id is None:
+            return ChatResponse(
+                message="I can't trigger a reflection — no child device is paired to this app yet. Open the BigKid debug panel and set the child id, or pair the kid's phone first.",
+                reasoning=reasoning, action=None,
+            )
+        try:
+            content = await generate_reflection_content(reason=reason)
+        except Exception as exc:
+            logger.warning("Gemini reflection content generation failed: {}", exc)
+            return ChatResponse(
+                message=f"I couldn't generate the reflection content right now ({exc!s}). Try again in a moment.",
+                reasoning=reasoning, action=None,
+            )
+        store = get_bigkid_store()
+        store.trigger_reflection_with_content(
+            req.child_device_id, reason=reason,
+            display_reason=content.display_reason,
+            video_id=content.video_id, video_title=content.video_title,
+            writing_prompt=content.writing_prompt,
+            quiz_public=[QuizQuestionPublic(q=q.q, options=q.options) for q in content.quiz],
+            correct_indices=[q.correct_index for q in content.quiz],
+        )
+        confirm = (
+            f"Done — reflection queued for the kid's phone.\n\n"
+            f"They'll see: “{content.display_reason}”\n\n"
+            f"Three steps (video → quiz → writing) will unlock their device when finished."
+        )
+        return ChatResponse(message=confirm, reasoning=reasoning, action=None)
 
     # Fetch family state for dispatcher
     saved_list_names: list[str] = []

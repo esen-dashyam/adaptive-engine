@@ -10,10 +10,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.app.core.settings import settings
+from pydantic import BaseModel
+
 from backend.app.schemas.bigkid import (
-    ParentBypassRespondBody, ParentReflectionApproveBody,
-    ParentReflectionTriggerBody, ParentTaskReviewBody,
-    QuizQuestionPublic, ReflectionRequest, Task,
+    BypassRequest, ChildStateResponse, ParentBypassRespondBody,
+    ParentReflectionApproveBody, ParentReflectionTriggerBody,
+    ParentTaskReviewBody, QuizQuestionPublic, ReflectionRequest, Task,
+    TaskCategory,
 )
 from backend.app.services.bigkid_store import BigKidStore, get_store
 from backend.app.services.gemini_reflection import generate_reflection_content
@@ -103,3 +106,71 @@ def review_task(
                     cid, task_id, decision=body.decision, redo_reason=body.redo_reason,
                 )
     raise HTTPException(status_code=404, detail="task not found")
+
+
+# ---------- parent reads kid state ----------
+# Mirrors /child/state but lives under /parent so the parent app doesn't have
+# to call kid-scoped endpoints. Parent passes the same child_id stored in
+# @AppStorage("evlin.childDeviceID") (set during pairing).
+
+@router.get("/parent/state/{child_id}", response_model=ChildStateResponse)
+def parent_state(
+    child_id: UUID,
+    store: BigKidStore = Depends(get_store),
+) -> ChildStateResponse:
+    return store.get_state(child_id)
+
+
+# ---------- parent creates a task on the child ----------
+
+class ParentTaskCreateBody(BaseModel):
+    child_id: UUID
+    title: str
+    description: str
+    category: TaskCategory
+    due: str | None = None  # human-readable, e.g. "Today, 6:00 PM"
+
+
+@router.post("/parent/task", response_model=Task)
+def create_task(
+    body: ParentTaskCreateBody,
+    store: BigKidStore = Depends(get_store),
+) -> Task:
+    return store.create_task(
+        body.child_id,
+        title=body.title.strip(),
+        description=body.description.strip(),
+        category=body.category,
+        due=(body.due or None),
+    )
+
+
+# ---------- parent deletes a task ----------
+
+@router.delete("/parent/task/{task_id}", status_code=204)
+def delete_task(
+    task_id: UUID,
+    store: BigKidStore = Depends(get_store),
+) -> None:
+    for cid, s in store._states.items():  # noqa: SLF001
+        for t in s.tasks:
+            if t.id == task_id:
+                store.delete_task(cid, task_id)
+                return
+    raise HTTPException(status_code=404, detail="task not found")
+
+
+# ---------- parent responds to a bypass request ----------
+
+@router.post("/parent/bypass/{bypass_id}/respond", response_model=BypassRequest)
+def respond_bypass(
+    bypass_id: UUID,
+    body: ParentBypassRespondBody,
+    store: BigKidStore = Depends(get_store),
+) -> BypassRequest:
+    try:
+        return store.respond_bypass(
+            bypass_id, decision=body.decision, message=body.message,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
