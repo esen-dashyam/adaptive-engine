@@ -107,29 +107,32 @@ def reflection_nudge(
     return NudgeResponse(ends_at=store.nudge_parent(child, rid))
 
 
-@router.post("/child/reflection/{rid}/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.post("/child/reflection/{rid}/ack", response_model=None)
 def reflection_ack(
     rid: UUID,
     child: UUID = Depends(child_id_dep),
     store: BigKidStore = Depends(get_store),
-) -> None:
+) -> Response:
     store.ack_reflection(child, rid)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/child/daily-complete/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.post("/child/daily-complete/ack", response_model=None)
 def daily_complete_ack(
     child: UUID = Depends(child_id_dep),
     store: BigKidStore = Depends(get_store),
-) -> None:
+) -> Response:
     store.ack_daily_complete(child)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/child/screen-time-finished/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.post("/child/screen-time-finished/ack", response_model=None)
 def screen_time_finished_ack(
     child: UUID = Depends(child_id_dep),
     store: BigKidStore = Depends(get_store),
-) -> None:
+) -> Response:
     store.ack_screen_time_finished(child)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/child/time-consumption")
