@@ -106,6 +106,7 @@ class GeminiAgentClient:
         state_snapshot: dict | None,
         user_message: str | None,
         tool_results: list[dict] | None,  # [{call_id, name, status, data?, error?}]
+        prior_tool_calls: list[Any] | None = None,  # Replay of last turn's function calls
         tools: list[dict],
         child_name: str,
     ) -> GeminiResponse:
@@ -140,9 +141,26 @@ class GeminiAgentClient:
             ))
 
         if tool_results is not None:
-            # Tool results go back as function_response parts. Gemini's SDK
-            # accepts these as user-role Content; the `name` lets the model
-            # match each response to the prior function_call it issued.
+            # Gemini contract requires alternation:
+            #   user → model(function_call) → user(function_response) → model
+            # Replay the prior turn's function_call(s) as a model-role
+            # Content BEFORE we attach the function_response parts; without
+            # this the SDK either 400s or treats the response as a fresh
+            # message and re-emits the same call (driving the loop to its
+            # iteration cap).
+            if prior_tool_calls:
+                contents.append(types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_function_call(
+                            name=fc.name, args=fc.args or {},
+                        )
+                        for fc in prior_tool_calls
+                    ],
+                ))
+            # Tool results go back as function_response parts. The `name`
+            # lets the model match each response to the prior function_call
+            # it issued.
             for tr in tool_results:
                 response_payload: dict[str, Any] = {
                     "status": tr.get("status"),

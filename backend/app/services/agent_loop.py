@@ -53,6 +53,11 @@ class AgentLoop:
         proposals: list[Proposal] = []
         receipts: list[Receipt] = []
         last_results: list[dict] = []
+        # Tool calls from the previous Gemini turn — must be replayed back
+        # to Gemini paired with their function_response parts so the SDK
+        # can chain reasoning correctly. Without this, the model often
+        # re-emits the same call or 400s on contract violation.
+        prior_tool_calls: list[Any] = []
 
         for iteration in range(MAX_ITERATIONS):
             resp = await self.gemini.chat(
@@ -60,6 +65,7 @@ class AgentLoop:
                 state_snapshot=inp.state_snapshot,
                 user_message=inp.message if iteration == 0 else None,
                 tool_results=last_results if iteration > 0 else None,
+                prior_tool_calls=prior_tool_calls if iteration > 0 else None,
                 tools=self.registry.declarations(),
                 child_name=inp.child_name,
             )
@@ -70,6 +76,11 @@ class AgentLoop:
                     proposals=proposals,
                     receipts=receipts,
                 )
+
+            # Remember this turn's calls so the next iteration can replay
+            # them back as the model's prior function_call Content (Gemini
+            # contract: user → model(function_call) → user(function_response)).
+            prior_tool_calls = list(resp.tool_calls)
 
             last_results = []
             for call in resp.tool_calls:
