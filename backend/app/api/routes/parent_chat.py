@@ -319,14 +319,27 @@ async def parent_chat(
             action_log=get_action_log(),
             proposal_store=get_proposal_store(),
         )
-        agent_resp = await loop.run(AgentInput(
-            message=req.message,
-            history=req.history,
-            child_device_id=req.child_device_id,
-            child_name=req.child_name,
-            state_snapshot=state_snapshot,
-            force_confirmations=req.force_confirmations or [],
-        ))
+        # TEMP: catch all agent-path exceptions and surface them in the
+        # response body so we can debug without scraping Railway logs.
+        # Remove once the agent path is stable.
+        try:
+            agent_resp = await loop.run(AgentInput(
+                message=req.message,
+                history=req.history,
+                child_device_id=req.child_device_id,
+                child_name=req.child_name,
+                state_snapshot=state_snapshot,
+                force_confirmations=req.force_confirmations or [],
+            ))
+        except Exception as exc:
+            import traceback
+            tb_lines = traceback.format_exception(exc)
+            tail = "".join(tb_lines)[-2000:]
+            return ChatResponse(
+                message=f"[AGENT DEBUG] {type(exc).__name__}: {exc}\n\n--- traceback tail ---\n{tail}",
+                reasoning="agent path raised — see message body",
+                action=None,
+            )
         # Forward proposals + receipts. Reviewer flagged this — earlier
         # drafts dropped them. iOS uses these to render the agent UI.
         return ChatResponse(
