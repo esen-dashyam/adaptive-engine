@@ -26,12 +26,6 @@ class BigKidStore:
     def __init__(self) -> None:
         self._states: dict[UUID, _ChildState] = {}
         self._reflection_correct: dict[tuple[UUID, UUID], list[int]] = {}
-        # In-memory evidence blob storage. Keyed by (child_id, task_id).
-        # v1 — survives until process restart. Phase 13 follow-up: replace
-        # with Supabase Storage. Stored as raw JPEG bytes; served back via
-        # GET /child/evidence/{child}/{task}.jpg so the parent app can show
-        # actual photos in TaskDetailSheet instead of broken placeholder URLs.
-        self._evidence_blobs: dict[tuple[UUID, UUID], bytes] = {}
 
     # ---------- read ----------
 
@@ -43,23 +37,22 @@ class BigKidStore:
 
     def submit_evidence(
         self, child_id: UUID, task_id: UUID, *,
-        photo_url: str, photo_bytes: bytes | None, note: str | None,
+        photo_url: str, photo_bytes: bytes | None = None, note: str | None,
     ) -> Task:
+        # `photo_bytes` is unused since blobs moved to Supabase Storage,
+        # kept in the signature for API compatibility — Phase 13 may use
+        # it again for an offline-cache fallback.
+        _ = photo_bytes
         s = self._ensure_seeded(child_id)
         task = s.task(task_id)
         task.evidence_photo_url = photo_url
         task.evidence_note = note
         task.status = TaskStatus.submitted
         task.phase = TaskPhase.submitted
-        if photo_bytes is not None:
-            self._evidence_blobs[(child_id, task_id)] = photo_bytes
         if task.bypass and task.bypass.status == BypassStatus.pending:
             task.bypass.status = BypassStatus.withdrawn
             task.bypass.responded_at = datetime.now(timezone.utc)
         return task
-
-    def get_evidence_blob(self, child_id: UUID, task_id: UUID) -> bytes | None:
-        return self._evidence_blobs.get((child_id, task_id))
 
     # ---------- parent task creation ----------
 
@@ -348,10 +341,7 @@ def get_store() -> BigKidStore:
     return _singleton
 
 
-def evidence_url(child_id: UUID, task_id: UUID, *, base: str = "") -> str:
-    """Stable backend URL where the parent app can `GET` the evidence photo.
-    Points at our own `/child/evidence/{child}/{task}.jpg` route which the
-    store backs with the in-memory blob written during `submit_evidence`.
-    Phase 13 follow-up: swap for Supabase Storage CDN URLs (per spec §13 Q4).
-    """
-    return f"{base.rstrip('/')}/api/v1/child/evidence/{child_id}/{task_id}.jpg"
+# NOTE: previous in-memory blob storage + `evidence_url()` helper removed.
+# Evidence photos now live in Supabase Storage (services/evidence_storage.py)
+# and the URL embedded in `Task.evidence_photo_url` is the public CDN URL
+# from `bucket.get_public_url(...)`.
