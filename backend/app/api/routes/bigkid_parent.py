@@ -39,6 +39,7 @@ async def trigger_reflection(
             content = await generate_reflection_content(reason=body.reason)
             return store.trigger_reflection_with_content(
                 body.child_id, reason=body.reason,
+                display_reason=content.display_reason,
                 video_id=content.video_id, video_title=content.video_title,
                 writing_prompt=content.writing_prompt,
                 quiz_public=[QuizQuestionPublic(q=q.q, options=q.options) for q in content.quiz],

@@ -23,11 +23,21 @@ _PLACEHOLDER_VIDEO_TITLE = "Why rest time matters for your brain (placeholder)"
 
 PROMPT_TEMPLATE = """\
 You are designing a reflection exercise for an 8–12 year old child after \
-the following issue (described by their parent):
+the following issue, described by their parent:
 
   {reason}
 
-Generate strict JSON with two keys, no prose, no code fences:
+The parent's wording above may be a sentence fragment, contain rude \
+language, or use grammar that doesn't fit a child-facing screen. You \
+will rephrase it on their behalf.
+
+Generate strict JSON with three keys, no prose, no code fences:
+
+- "displayReason": ONE complete second-person sentence stating what the \
+child did wrong, in calm and non-shaming language a 10-year-old will \
+understand. End with a period. If the parent used a slur or rude word, \
+soften it without changing the meaning. The sentence should read as \
+clean grammar on its own — do not start with "You did" mechanically.
 
 - "quiz": EXACTLY 5 multiple-choice questions that probe the child's \
 understanding of *why what they did was a problem* and *what better \
@@ -58,6 +68,7 @@ class ReflectionContent:
     video_title: str
     quiz: list[QuizSeed]
     writing_prompt: str
+    display_reason: str    # kid-facing rephrasing of the parent's reason
 
 
 def _strip_code_fence(raw: str) -> str:
@@ -78,12 +89,16 @@ async def generate_reflection_content(*, reason: str) -> ReflectionContent:
     parsed = json.loads(_strip_code_fence(raw))
     if len(parsed.get("quiz", [])) != 5:
         raise ValueError("Gemini returned wrong number of quiz questions")
+    display = (parsed.get("displayReason") or "").strip()
+    if not display:
+        raise ValueError("Gemini omitted displayReason")
     return ReflectionContent(
         video_id=_PLACEHOLDER_VIDEO_ID,
         video_title=_PLACEHOLDER_VIDEO_TITLE,
         quiz=[QuizSeed(q=q["q"], options=q["options"],
                        correct_index=int(q["correctIndex"])) for q in parsed["quiz"]],
         writing_prompt=parsed["writingPrompt"],
+        display_reason=display,
     )
 
 

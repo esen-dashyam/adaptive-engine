@@ -98,14 +98,14 @@ class BigKidStore:
         return req
 
     def trigger_reflection_with_content(
-        self, child_id: UUID, *, reason: str,
+        self, child_id: UUID, *, reason: str, display_reason: str | None,
         video_id: str, video_title: str, writing_prompt: str,
         quiz_public: list[QuizQuestionPublic], correct_indices: list[int],
     ) -> ReflectionRequest:
         s = self._ensure_seeded(child_id)
         rid = uuid4()
         req = ReflectionRequest(
-            id=rid, reason=reason,
+            id=rid, reason=reason, display_reason=display_reason,
             video_id=video_id, video_title=video_title,
             writing_prompt=writing_prompt, quiz=quiz_public,
             status=ReflectionStatus.pending,

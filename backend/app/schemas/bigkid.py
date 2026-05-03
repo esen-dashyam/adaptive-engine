@@ -78,7 +78,8 @@ class QuizQuestionPublic(BaseModel):
 
 class ReflectionRequest(BaseModel):
     id: UUID
-    reason: str
+    reason: str                            # raw parent input (kept for record)
+    display_reason: Optional[str] = None   # Gemini-rephrased kid-facing version
     video_id: str
     video_title: str
     writing_prompt: str
