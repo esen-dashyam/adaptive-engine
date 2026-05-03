@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel
 
 from backend.app.schemas.bigkid import (
@@ -107,7 +107,7 @@ def reflection_nudge(
     return NudgeResponse(ends_at=store.nudge_parent(child, rid))
 
 
-@router.post("/child/reflection/{rid}/ack", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/child/reflection/{rid}/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def reflection_ack(
     rid: UUID,
     child: UUID = Depends(child_id_dep),
@@ -116,7 +116,7 @@ def reflection_ack(
     store.ack_reflection(child, rid)
 
 
-@router.post("/child/daily-complete/ack", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/child/daily-complete/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def daily_complete_ack(
     child: UUID = Depends(child_id_dep),
     store: BigKidStore = Depends(get_store),
@@ -124,7 +124,7 @@ def daily_complete_ack(
     store.ack_daily_complete(child)
 
 
-@router.post("/child/screen-time-finished/ack", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/child/screen-time-finished/ack", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def screen_time_finished_ack(
     child: UUID = Depends(child_id_dep),
     store: BigKidStore = Depends(get_store),
