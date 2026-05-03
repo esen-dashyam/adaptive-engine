@@ -25,6 +25,64 @@ from backend.app.services.gemini_reflection import generate_reflection_content
 router = APIRouter(tags=["Big-Kid Parent"])
 
 
+@router.get("/parent/_supabase_debug")
+async def supabase_debug() -> dict:
+    """Diagnose Supabase connectivity from inside Railway. Reports the
+    URL/key shape (without leaking secrets) and tries a real DNS lookup +
+    HTTP HEAD against the configured URL so we can tell whether the
+    failure is `not configured`, `typo`, `project paused`, or something
+    else."""
+    import socket
+    from urllib.parse import urlparse
+    import httpx
+
+    url = settings.supabase_url
+    key = settings.supabase_key
+    out: dict = {
+        "url_set": bool(url),
+        "url_length": len(url),
+        # First 12 + last 12 chars only — enough to spot typos without
+        # exposing the full host.
+        "url_preview": (url[:12] + "..." + url[-12:]) if len(url) > 24 else url,
+        "url_has_whitespace": url != url.strip(),
+        "url_has_quotes": url.startswith('"') or url.startswith("'"),
+        "key_set": bool(key),
+        "key_length": len(key),
+    }
+    if not url:
+        out["verdict"] = "SUPABASE_URL not visible to settings"
+        return out
+
+    parsed = urlparse(url.strip())
+    host = parsed.hostname or ""
+    out["parsed_host"] = host
+    out["parsed_scheme"] = parsed.scheme
+
+    try:
+        ip = socket.gethostbyname(host)
+        out["dns_ok"] = True
+        out["dns_resolves_to"] = ip
+    except Exception as exc:
+        out["dns_ok"] = False
+        out["dns_error"] = repr(exc)
+        out["verdict"] = (
+            "Hostname doesn't resolve. Either typo in URL, project paused, "
+            "or Railway egress can't reach Supabase DNS."
+        )
+        return out
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{parsed.scheme}://{host}/rest/v1/",
+                            headers={"apikey": key, "Authorization": f"Bearer {key}"})
+        out["http_status"] = r.status_code
+        out["verdict"] = "OK" if r.status_code < 500 else f"Supabase returned {r.status_code}"
+    except Exception as exc:
+        out["http_error"] = repr(exc)
+        out["verdict"] = "DNS resolved but HTTP request failed"
+    return out
+
+
 @router.get("/parent/_bigkid_debug")
 async def bigkid_debug() -> dict:
     """Diagnose why a trigger fell through to fixture. Returns whether
