@@ -116,28 +116,50 @@ class GeminiAgentClient:
         # Build conversation contents.
         contents: list[types.Content] = []
 
-        # Replay conversation history (last 10).
+        # Replay conversation history (last 10), but apply Gemini's strict
+        # turn-alternation requirements when tools are enabled:
+        #   - First turn must be role="user"
+        #   - No consecutive same-role turns
+        #   - No empty parts
+        # The iOS app's seed conversation begins with three "agent" bubbles,
+        # which fails this validator with a misleading "function call turn"
+        # error message because Gemini's tool-mode internally validates the
+        # transcript with function-call assumptions.
+        cleaned: list[tuple[str, str]] = []  # (role, text) after filtering
         for h in history[-10:]:
+            text = str(h.get("content", "")).strip()
+            if not text:
+                continue
             raw_role = (h.get("role") or "").lower()
-            # ChatViewModel uses "user" / "agent"; legacy mock uses "parent".
-            # Anything not clearly an assistant role becomes "user" (Gemini
-            # only accepts "user" / "model" — extra roles raise 400).
             role = (
                 "model"
                 if raw_role in ("agent", "assistant", "evlin")
                 else "user"
             )
+            if cleaned and cleaned[-1][0] == role:
+                # Merge consecutive same-role turns into one content block.
+                prev_role, prev_text = cleaned[-1]
+                cleaned[-1] = (prev_role, f"{prev_text}\n\n{text}")
+            else:
+                cleaned.append((role, text))
+        # Drop leading model turns (Gemini expects user-first).
+        while cleaned and cleaned[0][0] == "model":
+            cleaned.pop(0)
+
+        # If we have a new user_message, merge it onto the last user-role
+        # entry (if any) so we don't emit two consecutive user turns.
+        if user_message is not None:
+            new_user_text = f"[Child context: {child_name}] {user_message}"
+            if cleaned and cleaned[-1][0] == "user":
+                prev_role, prev_text = cleaned[-1]
+                cleaned[-1] = (prev_role, f"{prev_text}\n\n{new_user_text}")
+            else:
+                cleaned.append(("user", new_user_text))
+
+        for role, text in cleaned:
             contents.append(types.Content(
                 role=role,
-                parts=[types.Part.from_text(text=str(h.get("content", "")))],
-            ))
-
-        if user_message is not None:
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part.from_text(
-                    text=f"[Child context: {child_name}] {user_message}",
-                )],
+                parts=[types.Part.from_text(text=text)],
             ))
 
         if tool_results is not None:
