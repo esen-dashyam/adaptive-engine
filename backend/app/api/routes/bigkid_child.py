@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
 from pydantic import BaseModel
 
 from backend.app.schemas.bigkid import (
@@ -12,7 +12,7 @@ from backend.app.schemas.bigkid import (
     QuizAnswerBody, QuizAnswerResponse, ReflectionRequest, ReflectionStep,
     Task, TimeConsumptionBody,
 )
-from backend.app.services.bigkid_store import BigKidStore, get_store, stub_upload_evidence
+from backend.app.services.bigkid_store import BigKidStore, get_store, evidence_url
 
 
 router = APIRouter(tags=["Big-Kid Child"])
@@ -38,6 +38,7 @@ def get_state(
 
 @router.post("/child/task/{task_id}/evidence", response_model=Task)
 async def submit_evidence(
+    request: Request,
     task_id: UUID,
     photo: UploadFile = File(...),
     note: str | None = Form(default=None),
@@ -47,8 +48,28 @@ async def submit_evidence(
     content = await photo.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="photo too large")
-    url = stub_upload_evidence(child, task_id, content)
-    return store.submit_evidence(child, task_id, photo_url=url, note=note)
+    # Build an absolute URL pointing back at our own /evidence route so the
+    # parent app's AsyncImage can load it without knowing the server host.
+    base = f"{request.url.scheme}://{request.url.netloc}"
+    url = evidence_url(child, task_id, base=base)
+    return store.submit_evidence(
+        child, task_id, photo_url=url, photo_bytes=content, note=note,
+    )
+
+
+@router.get("/child/evidence/{child_id}/{task_id}.jpg")
+def fetch_evidence(
+    child_id: UUID, task_id: UUID,
+    store: BigKidStore = Depends(get_store),
+) -> Response:
+    """Serve the stored evidence JPEG bytes back to the parent app.
+    Public read (no X-Child-Id) so the parent can load via AsyncImage —
+    URLs are unguessable UUIDs, acceptable for v1; revisit when Supabase
+    Storage replaces the in-memory blob (spec §13 Q4)."""
+    blob = store.get_evidence_blob(child_id, task_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="evidence not found")
+    return Response(content=blob, media_type="image/jpeg")
 
 
 @router.post("/child/bypass", response_model=BypassRequest)

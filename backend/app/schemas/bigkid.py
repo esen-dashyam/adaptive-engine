@@ -67,6 +67,7 @@ class Task(BaseModel):
     phase: TaskPhase
     redo_reason: Optional[str] = None
     evidence_photo_url: Optional[str] = None
+    evidence_note: Optional[str] = None     # kid's note attached to the photo
     bypass: Optional[BypassRequest] = None
 
 
