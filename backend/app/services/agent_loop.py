@@ -63,7 +63,14 @@ class AgentLoop:
             resp = await self.gemini.chat(
                 history=inp.history,
                 state_snapshot=inp.state_snapshot,
-                user_message=inp.message if iteration == 0 else None,
+                # Pass the original user message EVERY iteration so the
+                # contents list always starts with a user turn — without
+                # this the function_call replay on iter ≥ 1 has no user
+                # turn before it and Gemini 400s with "function call turn
+                # comes immediately after a user turn or function response".
+                # agent_gemini.chat dedupes by merging into trailing user
+                # content, so we don't double-send.
+                user_message=inp.message,
                 tool_results=last_results if iteration > 0 else None,
                 prior_tool_calls=prior_tool_calls if iteration > 0 else None,
                 tools=self.registry.declarations(),
