@@ -22,6 +22,30 @@ from backend.app.services.gemini_reflection import generate_reflection_content
 router = APIRouter(tags=["Big-Kid Parent"])
 
 
+@router.get("/parent/_bigkid_debug")
+async def bigkid_debug() -> dict:
+    """Diagnose why a trigger fell through to fixture. Returns whether
+    Gemini key is visible and, if so, attempts a real Gemini call so any
+    auth / model / parse error bubbles up instead of being swallowed by
+    the trigger endpoint's `except`."""
+    has_key = bool(settings.gemini_api_key)
+    no_gemini_flag = os.environ.get("BIGKID_NO_GEMINI", "0") == "1"
+    if not has_key:
+        return {"has_key": False, "no_gemini_flag": no_gemini_flag,
+                "verdict": "GEMINI_API_KEY not visible to settings — set it on Railway env"}
+    if no_gemini_flag:
+        return {"has_key": True, "no_gemini_flag": True,
+                "verdict": "BIGKID_NO_GEMINI=1 is forcing fixture"}
+    try:
+        content = await generate_reflection_content(reason="debug test sentence")
+        return {"has_key": True, "no_gemini_flag": False, "ok": True,
+                "display_reason_sample": content.display_reason,
+                "first_quiz_q": content.quiz[0].q if content.quiz else None}
+    except Exception as e:
+        return {"has_key": True, "no_gemini_flag": False, "ok": False,
+                "error": repr(e)}
+
+
 @router.post("/parent/reflection/trigger", response_model=ReflectionRequest)
 async def trigger_reflection(
     body: ParentReflectionTriggerBody,
