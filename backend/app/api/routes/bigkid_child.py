@@ -50,7 +50,13 @@ async def submit_evidence(
         raise HTTPException(status_code=413, detail="photo too large")
     # Build an absolute URL pointing back at our own /evidence route so the
     # parent app's AsyncImage can load it without knowing the server host.
-    base = f"{request.url.scheme}://{request.url.netloc}"
+    # Railway terminates TLS at the edge and forwards plain HTTP upstream,
+    # so request.url.scheme is "http". Trust X-Forwarded-Proto so the URL
+    # we hand back uses https — otherwise iOS App Transport Security will
+    # refuse to load the image.
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.url.netloc)
+    base = f"{scheme}://{host}"
     url = evidence_url(child, task_id, base=base)
     return store.submit_evidence(
         child, task_id, photo_url=url, photo_bytes=content, note=note,
