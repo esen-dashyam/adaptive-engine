@@ -22,25 +22,41 @@ _BUCKET_ENSURED = False  # one-shot per process
 
 def _ensure_bucket() -> None:
     """Create the bucket on first call. Public bucket so the URLs work
-    with `AsyncImage` (no signed-URL refresh dance). Idempotent — if the
-    bucket already exists Supabase returns an error we silently swallow.
+    with `AsyncImage` (no signed-URL refresh dance).
+
+    Note: requires the service_role key (`sb_secret_...`) — anon /
+    publishable keys (`sb_publishable_...`) are blocked by RLS and will
+    error here. We list buckets first to skip the create call when it
+    already exists; anything else surfaces with a useful message.
     """
     global _BUCKET_ENSURED
     if _BUCKET_ENSURED:
         return
     sb = get_supabase()
     try:
-        # supabase-py 2.x accepts options dict for public/file_size_limit
+        existing = {b.name for b in sb.storage.list_buckets()}
+    except Exception as exc:
+        logger.warning("Supabase storage.list_buckets failed: {}", exc)
+        existing = set()
+    if _BUCKET in existing:
+        _BUCKET_ENSURED = True
+        return
+    try:
         sb.storage.create_bucket(
             _BUCKET,
             options={"public": True, "file_size_limit": 5 * 1024 * 1024},
         )
         logger.info("Created Supabase bucket {}", _BUCKET)
+        _BUCKET_ENSURED = True
     except Exception as exc:
-        # "Bucket already exists" — totally fine. Anything else, log and
-        # let the upload attempt produce the real error.
-        logger.debug("create_bucket('{}') ignored: {}", _BUCKET, exc)
-    _BUCKET_ENSURED = True
+        # Don't mark _BUCKET_ENSURED — caller's upload will fail, but
+        # next request gets a clean retry once the user fixes auth.
+        logger.error("create_bucket('{}') failed: {}", _BUCKET, exc)
+        raise RuntimeError(
+            f"Could not create bucket '{_BUCKET}'. If using anon/publishable "
+            f"key, switch SUPABASE_KEY to a service_role key, or create the "
+            f"bucket manually in the Supabase dashboard. Original: {exc}"
+        ) from exc
 
 
 def upload_evidence(child_id: UUID, task_id: UUID, *, content: bytes) -> str:
