@@ -139,6 +139,7 @@ class AgentLoop:
                     continue
 
                 undo_token: str | None = None
+                undo_expires_iso: str | None = None
                 if self.action_log is not None and tool_meta.inverse_action:
                     inverse_args = (
                         tool_meta.inverse_args_builder(call.args, result)
@@ -151,10 +152,16 @@ class AgentLoop:
                         inverse_args=inverse_args,
                         source="agent",
                     )
+                    # Surface the absolute expiry so iOS Undo countdown
+                    # is wall-clock-driven (survives view navigation).
+                    entry = self.action_log.get(undo_token)
+                    if entry is not None:
+                        undo_expires_iso = entry.expires_at.isoformat()
                 receipts.append(Receipt(
                     tool=call.name, args=call.args,
                     summary=result.public_summary or call.name,
                     undo_token=undo_token,
+                    undo_expires_at=undo_expires_iso,
                 ))
                 last_results.append({
                     "call_id": call.id, "name": call.name,

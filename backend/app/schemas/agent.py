@@ -18,6 +18,12 @@ class Receipt(BaseModel):
     args: dict = Field(default_factory=dict)
     summary: str = ""
     undo_token: str | None = None
+    # ISO8601 wall-clock deadline after which Undo is rejected. iOS uses
+    # this to compute the remaining countdown so the timer survives view
+    # navigation (without it, every onAppear resets to 60s, masking that
+    # the window already closed). Null when the receipt has no inverse
+    # (read-only tools).
+    undo_expires_at: str | None = None
 
 
 class AgentResponse(BaseModel):

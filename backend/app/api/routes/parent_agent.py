@@ -55,6 +55,7 @@ async def exec_proposal(
     result = await GLOBAL_REGISTRY.call(tool_name, args)
 
     undo_token: str | None = None
+    undo_expires_iso: str | None = None
     if meta.inverse_action:
         inverse_args = (
             meta.inverse_args_builder(args, result)
@@ -66,8 +67,12 @@ async def exec_proposal(
             inverse_args=inverse_args,
             source="agent",
         )
+        entry = log.get(undo_token)
+        if entry is not None:
+            undo_expires_iso = entry.expires_at.isoformat()
     return Receipt(
         tool=tool_name, args=args,
         summary=result.public_summary or tool_name,
         undo_token=undo_token,
+        undo_expires_at=undo_expires_iso,
     )
