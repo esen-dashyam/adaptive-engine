@@ -159,3 +159,34 @@ async def test_approve_task_marks_done() -> None:
         "child_id": cid_str, "task_id": str(task.id),
     })
     assert result.public["status"] == "done"
+
+
+@_pytest.mark.asyncio
+async def test_propose_reflection_creates_reflection(monkeypatch) -> None:
+    from backend.app.services import bigkid_store
+    bigkid_store._singleton = None
+
+    # Stub out generate_reflection_content (it uses Gemini).
+    from backend.app.services import gemini_reflection
+    from backend.app.services.gemini_reflection import (
+        ReflectionContent, QuizSeed,
+    )
+    async def fake_gen(reason: str):
+        return ReflectionContent(
+            video_id="dQw4w9WgXcQ", video_title="Test",
+            quiz=[QuizSeed(q="Q?", options=["a", "b", "c", "d"], correct_index=0)] * 5,
+            writing_prompt="Reflect on it",
+            display_reason=f"You did something about: {reason}",
+        )
+    monkeypatch.setattr(gemini_reflection, "generate_reflection_content", fake_gen)
+
+    from backend.app.services.agent_tools import GLOBAL_REGISTRY
+    from backend.app.services.agent_tools import reflection_tools  # noqa: F401
+
+    cid = "77777777-7777-7777-7777-777777777777"
+    result = await GLOBAL_REGISTRY.call("propose_reflection", {
+        "child_id": cid, "reason": "called me a name",
+    })
+    assert "rid" in result.public
+    state = bigkid_store.get_store().get_state(UUID(cid))
+    assert state.reflection_request is not None
