@@ -217,18 +217,53 @@ class GeminiAgentClient:
             for t in tools
         ])
 
+        # DEBUG: attach a structured request-shape summary to any
+        # exception we raise — surfaces in /parent/chat's debug envelope.
+        def _shape_summary() -> str:
+            roles = [getattr(c, "role", "?") for c in contents]
+            part_types = []
+            for c in contents:
+                row = []
+                for p in (getattr(c, "parts", None) or []):
+                    if getattr(p, "function_call", None):
+                        row.append(f"fcall({p.function_call.name})")
+                    elif getattr(p, "function_response", None):
+                        row.append(f"fresp({p.function_response.name})")
+                    elif getattr(p, "text", None) is not None:
+                        row.append(f"text({len(p.text)}c)")
+                    else:
+                        row.append("?")
+                part_types.append("|".join(row))
+            tool_names = [
+                fd.name
+                for fd in (tool_decl.function_declarations or [])
+            ]
+            return (
+                f"contents_len={len(contents)} roles={roles} "
+                f"parts_per_content={part_types} "
+                f"sys_instr_len={len(sys_text)} "
+                f"tools_count={len(tool_names)} tool_names={tool_names[:10]}"
+            )
+
         # generate_content is blocking; offload to a thread so the FastAPI
         # event loop stays responsive.
         def _call_sync():
-            return client.models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=sys_text,
-                    temperature=0.4,
-                    tools=[tool_decl],
-                ),
-            )
+            try:
+                return client.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=sys_text,
+                        temperature=0.4,
+                        tools=[tool_decl],
+                    ),
+                )
+            except Exception as exc:
+                # Re-raise with a structured request-shape summary appended.
+                raise RuntimeError(
+                    f"{type(exc).__name__}: {exc} | request_shape: "
+                    f"{_shape_summary()}"
+                ) from exc
 
         resp = await asyncio.to_thread(_call_sync)
 
