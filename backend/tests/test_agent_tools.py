@@ -121,3 +121,41 @@ async def test_review_submissions_calls_multimodal_for_each(monkeypatch) -> None
     verdicts = result.public["verdicts"]
     assert len(verdicts) == 1
     assert verdicts[0]["recommend_action"] == "approve"
+
+
+@_pytest.mark.asyncio
+async def test_assign_task_creates_task() -> None:
+    from backend.app.services import bigkid_store
+    bigkid_store._singleton = None
+    from backend.app.services.agent_tools import GLOBAL_REGISTRY
+    from backend.app.services.agent_tools import task_tools  # noqa: F401
+
+    cid = "55555555-5555-5555-5555-555555555555"
+    before = bigkid_store.get_store().get_state(UUID(cid)).tasks
+    result = await GLOBAL_REGISTRY.call("assign_task", {
+        "child_id": cid, "title": "Sweep porch",
+        "description": "Sweep the front porch.", "category": "Chores",
+        "due": "Today, 6 PM",
+    })
+    assert "task_id" in result.public
+    after = bigkid_store.get_store().get_state(UUID(cid)).tasks
+    assert len(after) == len(before) + 1
+
+
+@_pytest.mark.asyncio
+async def test_approve_task_marks_done() -> None:
+    from backend.app.services import bigkid_store
+    bigkid_store._singleton = None
+    store = bigkid_store.get_store()
+    cid_str = "66666666-6666-6666-6666-666666666666"
+    cid = UUID(cid_str)
+    task = store.get_state(cid).tasks[0]
+    # Submit so approve is meaningful.
+    store.submit_evidence(cid, task.id, photo_url="https://x", photo_bytes=None, note=None)
+
+    from backend.app.services.agent_tools import GLOBAL_REGISTRY
+    from backend.app.services.agent_tools import task_tools  # noqa: F401
+    result = await GLOBAL_REGISTRY.call("approve_task", {
+        "child_id": cid_str, "task_id": str(task.id),
+    })
+    assert result.public["status"] == "done"
