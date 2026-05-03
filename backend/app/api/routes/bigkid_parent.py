@@ -9,6 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from backend.app.core.settings import settings
 from backend.app.schemas.bigkid import (
     ParentBypassRespondBody, ParentReflectionApproveBody,
     ParentReflectionTriggerBody, ParentTaskReviewBody,
@@ -26,12 +27,13 @@ async def trigger_reflection(
     body: ParentReflectionTriggerBody,
     store: BigKidStore = Depends(get_store),
 ) -> ReflectionRequest:
-    # Gemini-driven content path. Auto-enabled whenever GEMINI_API_KEY is
-    # available — no separate feature flag — so the quiz + writing prompt
-    # are always tailored to the parent's reason. Setting BIGKID_NO_GEMINI=1
-    # forces the fixture path (offline / unit tests).
+    # Gemini-driven content path. Auto-enabled whenever the project's
+    # `settings.gemini_api_key` is configured (matches every other
+    # Gemini call site in the codebase — supports both real env vars
+    # and a `.env` file picked up by pydantic-settings).
+    # `BIGKID_NO_GEMINI=1` forces the fixture path (offline / unit tests).
     use_gemini = (
-        bool(os.environ.get("GEMINI_API_KEY"))
+        bool(settings.gemini_api_key)
         and os.environ.get("BIGKID_NO_GEMINI", "0") != "1"
     )
     if use_gemini:

@@ -6,14 +6,19 @@ Public entry: ``generate_reflection_content(reason)`` returning a structured
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 
 import httpx
 
+from backend.app.core.settings import settings
 
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-YOUTUBE_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+def _gemini_key() -> str:
+    """Read at call time (not import time) so test fixtures and runtime
+    overrides take effect. Mirrors how the rest of the project reads
+    `settings.gemini_api_key` — supports both real env vars and a
+    `.env` file picked up by pydantic-settings."""
+    return settings.gemini_api_key or ""
 
 # Placeholder video — Gemini-generated quiz + writing prompt are tailored
 # to the parent's reason, but the YouTube embed is currently hard-coded to
@@ -103,11 +108,12 @@ async def generate_reflection_content(*, reason: str) -> ReflectionContent:
 
 
 async def _call_gemini(prompt: str) -> str:
-    if not GEMINI_KEY:
+    key = _gemini_key()
+    if not key:
         raise RuntimeError("GEMINI_API_KEY missing")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+        f"gemini-1.5-flash:generateContent?key={key}"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
