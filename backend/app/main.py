@@ -41,6 +41,7 @@ from backend.app.api.routes.child_device import router as child_device_router
 from backend.app.api.routes.family import router as evlin_family_router
 from backend.app.api.routes.bigkid_child import router as bigkid_child_router
 from backend.app.api.routes.bigkid_parent import router as bigkid_parent_router
+from backend.app.api.routes.parent_actions import router as parent_actions_router
 
 
 @asynccontextmanager
@@ -128,6 +129,7 @@ app.include_router(evlin_family_router,       prefix=settings.api_prefix)
 # Big-kid child mode
 app.include_router(bigkid_child_router,  prefix=settings.api_prefix)
 app.include_router(bigkid_parent_router, prefix=settings.api_prefix)
+app.include_router(parent_actions_router, prefix=settings.api_prefix)
 
 
 # Serve game HTML5 exports as static files
