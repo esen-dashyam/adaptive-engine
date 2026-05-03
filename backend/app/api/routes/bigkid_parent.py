@@ -25,6 +25,22 @@ from backend.app.services.gemini_reflection import generate_reflection_content
 router = APIRouter(tags=["Big-Kid Parent"])
 
 
+@router.post("/parent/_debug/reset/{child_id}", response_model=ChildStateResponse)
+def debug_reset_state(
+    child_id: UUID,
+    store: BigKidStore = Depends(get_store),
+) -> ChildStateResponse:
+    """DEBUG: drop a child's state from the store so the next /child/state
+    or /parent/state call re-seeds from fixture (Make bed / Math homework /
+    Brush teeth, all back to todo). Used by the kid app's debug menu so
+    you can re-test the flow without redeploying / re-pairing.
+
+    Note: evidence photos in Supabase Storage stay (they're keyed by
+    UUID). New tasks have new UUIDs so they don't reference old uploads."""
+    store._states.pop(child_id, None)  # noqa: SLF001
+    return store.get_state(child_id)
+
+
 @router.get("/parent/_supabase_debug")
 async def supabase_debug() -> dict:
     """Diagnose Supabase connectivity from inside Railway. Reports the
