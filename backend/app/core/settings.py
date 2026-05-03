@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     agent_mastery_threshold: float = 0.7   # below this = gap
     agent_gap_limit: int = 5               # max gaps to remediate in one round
 
+    # Parent-chat agent feature flag — when True, /parent/chat routes
+    # through AgentLoop (Gemini function-calling + ToolRegistry). When
+    # False (default), the legacy verb-table dispatcher path runs.
+    agent_enabled: bool = False
+
     # GraphRAG
     rag_enabled: bool = True
     rag_graph_hop_depth: int = 4        # max prerequisite nodes to retrieve per standard

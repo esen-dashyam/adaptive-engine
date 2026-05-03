@@ -28,6 +28,18 @@ from backend.app.services.bigkid_store import get_store as get_bigkid_store
 from backend.app.services.chat_resolver import dispatch, DispatchResult
 from backend.app.services.gemini_reflection import generate_reflection_content
 from backend.app.schemas.bigkid import QuizQuestionPublic
+from backend.app.schemas.agent import Proposal, Receipt
+
+# Force tool modules to import at app startup so @tool decorators
+# register their tools into GLOBAL_REGISTRY exactly once. Doing this at
+# module top (NOT inside the route function) guarantees the registry is
+# populated before the first /parent/chat or /parent/agent/exec request.
+# shield_tools is intentionally NOT imported — that path stays on the
+# legacy verb-table dispatcher in v1.
+from backend.app.services.agent_tools import (  # noqa: F401
+    read_tools, task_tools, reflection_tools, bypass_tools,
+    lock_tools, vision_tools,
+)
 
 
 def _canonical_display(target_request: str | None) -> str | None:
@@ -234,6 +246,44 @@ class ChatResponse(BaseModel):
     message: str
     reasoning: str | None = None
     action: ChatAction | None = None
+    # Agent-path fields (default empty for back-compat with legacy iOS
+    # builds; legacy verb-table path leaves them empty).
+    proposals: list[Proposal] = Field(default_factory=list)
+    receipts: list[Receipt] = Field(default_factory=list)
+    cancelled_proposals: list[str] = Field(default_factory=list)
+
+
+def _trimmed_snapshot(state) -> dict:
+    """Strip context-bloat from the full ChildStateResponse for the
+    agent's auto-injected state. See spec §4.4. Drops quiz body, photo
+    URLs, and any large per-task fields."""
+    return {
+        "child_name": state.child_name,
+        "minutes_left": state.minutes_left,
+        "minutes_max": state.minutes_max,
+        "tasks": [
+            {
+                "id": str(t.id),
+                "title": t.title,
+                "status": t.status.value,
+                "phase": t.phase.value,
+                "has_photo": bool(t.evidence_photo_url),
+                "has_note": bool(t.evidence_note),
+                "has_bypass": t.bypass is not None,
+                "redo_reason": t.redo_reason,
+            }
+            for t in state.tasks
+        ],
+        "reflection_active": state.reflection_request is not None,
+        "reflection_reason": (
+            state.reflection_request.reason
+            if state.reflection_request else None
+        ),
+        "pending_bypass_count": sum(
+            1 for t in state.tasks
+            if t.bypass and t.bypass.status.value == "pending"
+        ),
+    }
 
 
 @router.post("/chat", response_model=ChatResponse, summary="Parent chat with Evlin AI")
@@ -244,6 +294,49 @@ async def parent_chat(
     """Verb-first dispatcher wiring (plan Phase 6 Task 6.3)."""
     if not settings.gemini_api_key:
         raise HTTPException(503, "Gemini API key not configured")
+
+    # Agent path — feature-flagged. When enabled, route through AgentLoop
+    # (function-calling + ToolRegistry) and return the proposals/receipts
+    # envelope directly. The legacy verb-table dispatcher below is left
+    # untouched for AGENT_ENABLED=0 builds.
+    if settings.agent_enabled:
+        from backend.app.services.agent_loop import AgentLoop, AgentInput
+        from backend.app.services.agent_gemini import GeminiAgentClient
+        from backend.app.services.agent_tools import GLOBAL_REGISTRY
+        from backend.app.services.parent_action_log import (
+            get_log as get_action_log,
+        )
+        from backend.app.services.proposal_store import get_proposal_store
+
+        state_snapshot: dict | None = None
+        if req.child_device_id is not None:
+            full = get_bigkid_store().get_state(req.child_device_id)
+            state_snapshot = _trimmed_snapshot(full)
+
+        loop = AgentLoop(
+            registry=GLOBAL_REGISTRY,
+            gemini=GeminiAgentClient(),
+            action_log=get_action_log(),
+            proposal_store=get_proposal_store(),
+        )
+        agent_resp = await loop.run(AgentInput(
+            message=req.message,
+            history=req.history,
+            child_device_id=req.child_device_id,
+            child_name=req.child_name,
+            state_snapshot=state_snapshot,
+            force_confirmations=req.force_confirmations or [],
+        ))
+        # Forward proposals + receipts. Reviewer flagged this — earlier
+        # drafts dropped them. iOS uses these to render the agent UI.
+        return ChatResponse(
+            message=agent_resp.message,
+            reasoning=agent_resp.reasoning,
+            action=None,
+            proposals=agent_resp.proposals,
+            receipts=agent_resp.receipts,
+            cancelled_proposals=agent_resp.cancelled_proposals,
+        )
 
     gemini_action, message, reasoning = await _invoke_gemini(req)
 
