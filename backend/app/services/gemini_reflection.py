@@ -111,9 +111,14 @@ async def _call_gemini(prompt: str) -> str:
     key = _gemini_key()
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing")
+    # Use the project-wide default model from settings (currently
+    # `gemini-2.5-flash`) so we follow the rest of the codebase when the
+    # model is rotated. `gemini-1.5-flash` was hardcoded here originally
+    # but Google deprecated that name and the endpoint returns 404.
+    model = settings.gemini_model or "gemini-2.5-flash"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={key}"
+        f"{model}:generateContent?key={key}"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
