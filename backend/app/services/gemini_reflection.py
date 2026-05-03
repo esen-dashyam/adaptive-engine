@@ -15,16 +15,33 @@ import httpx
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 YOUTUBE_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
+# Placeholder video — Gemini-generated quiz + writing prompt are tailored
+# to the parent's reason, but the YouTube embed is currently hard-coded to
+# Rick Astley until we wire YouTube Data API search (Phase 9 v2).
+_PLACEHOLDER_VIDEO_ID = "dQw4w9WgXcQ"
+_PLACEHOLDER_VIDEO_TITLE = "Why rest time matters for your brain (placeholder)"
+
 PROMPT_TEMPLATE = """\
-For an 8–12 year old, generate reflection content for this issue: {reason}.
-Return strict JSON with three keys:
-- "videoQuery": a single sentence YouTube search for an age-appropriate \
-educational video on the underlying topic
-- "quiz": an array of EXACTLY 5 multiple-choice questions, each with \
-"q" (string), "options" (array of 4 strings), "correctIndex" (integer 0..3)
-- "writingPrompt": a 1-2 sentence prompt asking the kid to reflect on their \
-behaviour and what they could do differently.
-Only output JSON. No prose, no code fences.
+You are designing a reflection exercise for an 8–12 year old child after \
+the following issue (described by their parent):
+
+  {reason}
+
+Generate strict JSON with two keys, no prose, no code fences:
+
+- "quiz": EXACTLY 5 multiple-choice questions that probe the child's \
+understanding of *why what they did was a problem* and *what better \
+choices look like*. Tone should be calm and non-shaming, not lecturing. \
+Make the questions specific to the issue above — do NOT use generic \
+"screen time" filler. Each question is an object with "q" (string), \
+"options" (array of 4 strings), "correctIndex" (integer 0..3). Every \
+question must have exactly one clearly correct answer.
+
+- "writingPrompt": a 1-2 sentence prompt asking the child to reflect on \
+*this specific situation* and what they could do differently next time. \
+Use the second person ("you") and reference the issue concretely.
+
+Output JSON only.
 """
 
 
@@ -43,14 +60,27 @@ class ReflectionContent:
     writing_prompt: str
 
 
+def _strip_code_fence(raw: str) -> str:
+    """Gemini sometimes wraps JSON in ```json ... ``` despite being asked
+    not to. Strip it so json.loads succeeds."""
+    s = raw.strip()
+    if s.startswith("```"):
+        # drop the opening fence (with optional language tag)
+        s = s.split("\n", 1)[1] if "\n" in s else s[3:]
+        # drop closing fence
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
 async def generate_reflection_content(*, reason: str) -> ReflectionContent:
     raw = await _call_gemini(PROMPT_TEMPLATE.format(reason=reason))
-    parsed = json.loads(raw)
-    if len(parsed["quiz"]) != 5:
+    parsed = json.loads(_strip_code_fence(raw))
+    if len(parsed.get("quiz", [])) != 5:
         raise ValueError("Gemini returned wrong number of quiz questions")
-    video_id, video_title = await _search_youtube(parsed["videoQuery"])
     return ReflectionContent(
-        video_id=video_id, video_title=video_title,
+        video_id=_PLACEHOLDER_VIDEO_ID,
+        video_title=_PLACEHOLDER_VIDEO_TITLE,
         quiz=[QuizSeed(q=q["q"], options=q["options"],
                        correct_index=int(q["correctIndex"])) for q in parsed["quiz"]],
         writing_prompt=parsed["writingPrompt"],

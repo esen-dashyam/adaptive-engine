@@ -26,7 +26,15 @@ async def trigger_reflection(
     body: ParentReflectionTriggerBody,
     store: BigKidStore = Depends(get_store),
 ) -> ReflectionRequest:
-    if os.environ.get("BIGKID_USE_GEMINI", "0") == "1":
+    # Gemini-driven content path. Auto-enabled whenever GEMINI_API_KEY is
+    # available — no separate feature flag — so the quiz + writing prompt
+    # are always tailored to the parent's reason. Setting BIGKID_NO_GEMINI=1
+    # forces the fixture path (offline / unit tests).
+    use_gemini = (
+        bool(os.environ.get("GEMINI_API_KEY"))
+        and os.environ.get("BIGKID_NO_GEMINI", "0") != "1"
+    )
+    if use_gemini:
         try:
             content = await generate_reflection_content(reason=body.reason)
             return store.trigger_reflection_with_content(
@@ -36,8 +44,10 @@ async def trigger_reflection(
                 quiz_public=[QuizQuestionPublic(q=q.q, options=q.options) for q in content.quiz],
                 correct_indices=[q.correct_index for q in content.quiz],
             )
-        except Exception:
-            pass  # fall through to fixture
+        except Exception as e:
+            # Fall through to fixture so the kid flow still works, but
+            # surface the reason in logs so you can diagnose.
+            print(f"[bigkid_parent] Gemini path failed, using fixture: {e!r}")
     return store.trigger_reflection(body.child_id, body.reason)
 
 
