@@ -32,3 +32,9 @@ class AgentResponse(BaseModel):
     proposals: list[Proposal] = Field(default_factory=list)
     receipts: list[Receipt] = Field(default_factory=list)
     cancelled_proposals: list[str] = Field(default_factory=list)
+    # Short-circuit signal: when shield_app / unshield_app etc. tools fire,
+    # they return a Gemini-shaped action dict in this field. AgentLoop
+    # exits the iteration loop and parent_chat forwards the dict through
+    # the legacy verb-table dispatcher (_handle_gemini_action), reusing
+    # all existing A1/B1/D1-D4 confirmation cards + Command queue logic.
+    legacy_gemini_action: dict | None = None

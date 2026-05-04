@@ -157,6 +157,23 @@ class AgentLoop:
                     entry = self.action_log.get(undo_token)
                     if entry is not None:
                         undo_expires_iso = entry.expires_at.isoformat()
+                # Short-circuit on legacy-forwarding tools (shield_app /
+                # unshield_app). They put a Gemini-shaped action dict in
+                # result.public["legacy_gemini_action"] for the chat
+                # endpoint to forward into the verb-table dispatcher.
+                # We exit the agent loop immediately — no point asking
+                # Gemini to "respond" to a result that will be replaced
+                # by a card or Command on the legacy path anyway.
+                if isinstance(result.public, dict) and result.public.get(
+                    "legacy_gemini_action"
+                ):
+                    return AgentResponse(
+                        message=result.public_summary or "",
+                        proposals=proposals,
+                        receipts=receipts,
+                        legacy_gemini_action=result.public["legacy_gemini_action"],
+                    )
+
                 receipts.append(Receipt(
                     tool=call.name, args=call.args,
                     summary=result.public_summary or call.name,

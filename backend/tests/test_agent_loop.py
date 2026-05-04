@@ -193,6 +193,46 @@ async def test_no_tool_calls_returns_text(fresh_registry) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_gemini_action_short_circuits_loop(fresh_registry) -> None:
+    """When a tool returns ToolResult.public['legacy_gemini_action'], the
+    AgentLoop must exit immediately with that dict on AgentResponse —
+    no further Gemini round-trip."""
+    from backend.app.services.agent_tools.decorator import tool, ToolResult
+
+    @tool(
+        registry=fresh_registry, name="forward_legacy",
+        description="Forwards to legacy", requires_confirm=False, danger="low",
+    )
+    async def forward_legacy(target: str) -> ToolResult:
+        return ToolResult(
+            public={"legacy_gemini_action": {"type": "shield", "target_request": target}},
+            public_summary="forwarding",
+        )
+
+    class StubGemini:
+        calls = 0
+
+        async def chat(self, **kw):
+            type(self).calls += 1
+            return _stub_response(tool_calls=[
+                _stub_call("c1", "forward_legacy", {"target": "ig"}),
+            ])
+
+    loop = AgentLoop(
+        registry=fresh_registry, gemini=StubGemini(),
+        action_log=None, proposal_store=None,
+    )
+    out = await loop.run(AgentInput(
+        message="lock ig", history=[], child_device_id=None,
+        child_name="Liam", state_snapshot=None,
+        force_confirmations=[],
+    ))
+    assert out.legacy_gemini_action == {"type": "shield", "target_request": "ig"}
+    assert StubGemini.calls == 1, "Loop should exit after short-circuit, not iterate"
+    assert out.proposals == []
+
+
+@pytest.mark.asyncio
 async def test_tool_result_passes_name_back(fresh_registry) -> None:
     """The adapter needs `name` in each tool_result entry to build a
     valid function_response Part. Verify it's included."""

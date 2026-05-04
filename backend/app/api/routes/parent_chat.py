@@ -38,7 +38,7 @@ from backend.app.schemas.agent import Proposal, Receipt
 # legacy verb-table dispatcher in v1.
 from backend.app.services.agent_tools import (  # noqa: F401
     read_tools, task_tools, reflection_tools, bypass_tools,
-    lock_tools, vision_tools,
+    lock_tools, vision_tools, shield_tools,
 )
 
 
@@ -319,6 +319,11 @@ async def parent_chat(
     # (function-calling + ToolRegistry) and return the proposals/receipts
     # envelope directly. The legacy verb-table dispatcher below is left
     # untouched for AGENT_ENABLED=0 builds.
+    # Agent path. shield/block/lock requests are handled by registered
+    # shield_tools (shield_app, unshield_app, block_app, unblock_app)
+    # which short-circuit the loop and forward to the legacy dispatcher
+    # via a `legacy_gemini_action` payload — see agent_resp handling
+    # below. No regex routing needed; the agent decides via tool calls.
     if settings.agent_enabled:
         from backend.app.services.agent_loop import AgentLoop, AgentInput
         from backend.app.services.agent_gemini import GeminiAgentClient
@@ -360,6 +365,18 @@ async def parent_chat(
                 reasoning="agent path raised — see message body",
                 action=None,
             )
+        # Legacy-forward: shield/block/lock tools fired and short-circuited
+        # the agent loop with a Gemini-shaped action dict. Run it through
+        # the existing dispatch+queue pipeline so iOS gets the same
+        # ChatResponse.action shape it would have gotten from the legacy
+        # verb-table path (A1/B1/D1-D4 cards or queued Command).
+        if agent_resp.legacy_gemini_action is not None:
+            return await _handle_gemini_action(
+                gemini_action=agent_resp.legacy_gemini_action,
+                message=agent_resp.message or "",
+                reasoning=agent_resp.reasoning,
+                req=req, session=session,
+            )
         # Forward proposals + receipts. Reviewer flagged this — earlier
         # drafts dropped them. iOS uses these to render the agent UI.
         return ChatResponse(
@@ -372,7 +389,24 @@ async def parent_chat(
         )
 
     gemini_action, message, reasoning = await _invoke_gemini(req)
+    return await _handle_gemini_action(
+        gemini_action=gemini_action, message=message, reasoning=reasoning,
+        req=req, session=session,
+    )
 
+
+async def _handle_gemini_action(
+    *,
+    gemini_action: dict | None,
+    message: str,
+    reasoning: str | None,
+    req: ChatRequest,
+    session: AsyncSession,
+) -> ChatResponse:
+    """Take a Gemini-shaped action dict and execute the legacy verb-table
+    flow: load family context, dispatch, branch on DispatchResult, queue
+    Command if resolved. Extracted from parent_chat() so the agent path's
+    shield_app tool can forward into it without duplicating logic."""
     # No action from Gemini — just a conversational reply
     if gemini_action is None:
         return ChatResponse(message=message, reasoning=reasoning, action=None)
