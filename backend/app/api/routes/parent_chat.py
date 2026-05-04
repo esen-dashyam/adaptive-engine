@@ -285,6 +285,11 @@ def _trimmed_snapshot(state, *, child_id: UUID) -> dict:
     return {
         "child_id": str(child_id),
         "child_name": state.child_name,
+        # Backend currently tracks one paired kid per parent. Even if iOS
+        # Home shows multiple Profile cards (Maya/Emma), those are mock
+        # demo data with no backend state. The agent should always resolve
+        # pronouns ('he'/'she'/'her'/'他'/'她') to this child without asking.
+        "is_only_paired_child": True,
         "minutes_left": state.minutes_left,
         "minutes_max": state.minutes_max,
         "tasks": [

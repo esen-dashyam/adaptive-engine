@@ -12,9 +12,15 @@ from backend.app.services.bigkid_store import get_store as get_bigkid_store
 @tool(
     name="assign_task",
     description=(
-        "Create a new task on the kid's list. category must be one of: "
-        "'Chores', 'Homework', 'Self-care'. due is human-readable like "
-        "'Today, 6:00 PM' (optional)."
+        "Create a new task on the kid's list. `category` must be one of "
+        "'Chores', 'Homework', 'Self-care' — INFER it from the title if "
+        "the parent didn't say (e.g. 'walk the dog' → Chores, 'finish "
+        "math' → Homework, 'brush teeth' → Self-care). `description` is "
+        "OPTIONAL — if the parent didn't give a separate description, "
+        "leave it blank and the title will be used as the description "
+        "automatically. DO NOT ask the parent for a description — just "
+        "create the task. `due` is human-readable like 'Today, 6:00 PM' "
+        "(also optional)."
     ),
     requires_confirm=False,
     danger="low",
@@ -23,12 +29,17 @@ from backend.app.services.bigkid_store import get_store as get_bigkid_store
     registry=GLOBAL_REGISTRY,
 )
 async def assign_task(
-    child_id: UUID, title: str, description: str, category: str,
+    child_id: UUID, title: str, category: str,
+    description: str = "",
     due: Optional[str] = None,
 ) -> ToolResult:
     cat = TaskCategory(category)
+    # If the agent didn't supply a description (parent didn't give one),
+    # fall back to the title so the kid's task-detail screen has
+    # something instead of an empty description block.
+    desc = description.strip() or title.strip()
     task = get_bigkid_store().create_task(
-        child_id, title=title.strip(), description=description.strip(),
+        child_id, title=title.strip(), description=desc,
         category=cat, due=due,
     )
     return ToolResult(
