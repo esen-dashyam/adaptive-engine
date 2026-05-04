@@ -23,16 +23,25 @@ from backend.app.services.agent_tools.decorator import (
 @tool(
     name="shield_app",
     description=(
-        "Shield (silence/lock/restrict/pause) an app or category on the kid's "
-        "device for a duration. Use this for ANY shield-shaped request — "
-        "'lock his phone for 30 min', 'shield Instagram', 'block tiktok' "
-        "(treat 'block X for Y' as shield since block is permanent), "
-        "'silence games', 'restrict social media', 'pause his phone'. "
-        "After this tool runs, the parent will see the existing confirmation "
-        "card flow (D1 to pick duration, A1 to confirm a block, etc.) — DO NOT "
-        "re-confirm with the parent in your message; just call the tool. "
-        "If duration is missing, leave minutes=null and the dispatcher will "
-        "show a quick-pick card."
+        "Shield/lock/silence/pause/restrict an app, a category, a saved list, "
+        "or the WHOLE PHONE for a duration. Use this for ANY shield- or "
+        "lock-shaped request including whole-device locks. Examples:\n"
+        "  'lock his phone for 30 min'        → target='his phone', target_kind='all', minutes=30\n"
+        "  'lock his phone'                   → target='his phone', target_kind='all' (no minutes — dispatcher shows duration picker)\n"
+        "  'shield Instagram for 20'          → target='Instagram', target_kind='app', minutes=20\n"
+        "  'lock everything'                  → target='everything', target_kind='all'\n"
+        "  'pause his games for an hour'      → target='games', target_kind='category', minutes=60, category_hint='games'\n"
+        "  'lock list 1'                      → target='list 1', target_kind='list'\n"
+        "\n"
+        "TARGET_KIND IS REQUIRED — pick exactly one:\n"
+        "  - 'all'      = whole device. Use for: 'his phone', 'her tablet', 'everything', 'all apps', 'his iPad', 'her iphone', 'whole phone'.\n"
+        "  - 'app'      = a specific app by name. Use for: 'Instagram', 'IG', 'TikTok', 'YouTube', 'Fortnite', 'Discord', etc.\n"
+        "  - 'category' = a category of apps. Use for: 'games', 'social', 'social apps', 'entertainment', 'productivity'.\n"
+        "  - 'list'     = a saved list the parent created. Use for: 'list 1', 'bedtime apps', 'homework block', or any name you've seen in saved-list state.\n"
+        "\n"
+        "DO NOT re-confirm with the parent in your message — the dispatcher "
+        "shows the right card (D1 duration picker, A1 destructive confirm, "
+        "etc). Just call the tool with what you parsed."
     ),
     requires_confirm=False,
     danger="medium",
@@ -40,8 +49,8 @@ from backend.app.services.agent_tools.decorator import (
 )
 async def shield_app(
     target: str,
+    target_kind: str,
     minutes: Optional[int] = None,
-    target_kind: str = "app",
     category_hint: Optional[str] = None,
 ) -> ToolResult:
     """Build a `shield`-typed gemini_action dict and short-circuit the loop.

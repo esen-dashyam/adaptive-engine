@@ -38,8 +38,13 @@ from backend.app.schemas.agent import Proposal, Receipt
 # legacy verb-table dispatcher in v1.
 from backend.app.services.agent_tools import (  # noqa: F401
     read_tools, task_tools, reflection_tools, bypass_tools,
-    lock_tools, vision_tools, shield_tools,
+    vision_tools, shield_tools,
 )
+# NOTE: lock_tools intentionally NOT imported. The lock_device/unlock_device
+# stubs there were placeholders before shield_tools landed. shield_app with
+# target_kind="all" now covers the "lock the whole phone" use case properly
+# via the legacy dispatcher. Importing lock_tools would re-register the
+# stubs into GLOBAL_REGISTRY and confuse Gemini.
 
 
 def _canonical_display(target_request: str | None) -> str | None:

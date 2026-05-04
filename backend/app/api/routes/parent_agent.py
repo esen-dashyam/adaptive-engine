@@ -24,7 +24,7 @@ from backend.app.services.proposal_store import (
 # imported — that path stays on the legacy verb-table dispatcher in v1.
 from backend.app.services.agent_tools import (  # noqa: F401
     read_tools, task_tools, reflection_tools, bypass_tools,
-    lock_tools, vision_tools,
+    vision_tools, shield_tools,
 )
 
 
